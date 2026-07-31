@@ -5,7 +5,7 @@
 // map asserts) — each shows its evidence strength, support classification and source count, and
 // is individually click-through to the evidence drawer. The screen ends with a real decision
 // action, "Approve as provisional narrative," not just a "continue" link.
-import { escapeHtml, relevanceLabel, strengthLabel } from "../labels.js";
+import { escapeHtml, relevanceLabel, strengthLabel, statementTypeBadge } from "../labels.js";
 import { setNarrativeApproved } from "../state.js";
 
 const PARTS = [
@@ -26,6 +26,23 @@ export async function renderNarrativeMapView(container, { service, state, drawer
     service.getCompetitorContrasts(),
     service.getEvidenceIndex(),
   ]);
+
+  // Only reachable in the live flow when no candidate passed review — see Recommendation.js's
+  // matching guard. Seeded cases always have a map; this never fires for Wix/HPS.
+  if (!map) {
+    container.innerHTML = `
+      <section class="screen-header">
+        <div class="eyebrow">5 · Narrative Map</div>
+        <h1>No Narrative Map yet</h1>
+        <p class="lead">StoryMap didn't recommend a direction, so there's no approved narrative to map. See the Recommendation screen for what evidence is missing.</p>
+      </section>
+      <div class="screen-footer">
+        <button class="primary-button" type="button" data-action="back">← Back to Recommendation</button>
+      </div>
+    `;
+    container.querySelector('[data-action="back"]').addEventListener("click", () => onNavigate("recommendation"));
+    return;
+  }
 
   const approved = state.narrativeApproved;
 
@@ -110,7 +127,20 @@ export async function renderNarrativeMapView(container, { service, state, drawer
   competitorContrasts.forEach((c) => {
     const row = document.createElement("div");
     row.className = "list-row";
-    row.innerHTML = `<b>${escapeHtml(c.competitor)}</b><span class="muted">${escapeHtml(c.contrast)}</span>`;
+    // Gated to the live case only — Wix/HPS competitor contrasts render exactly as
+    // before. The live pipeline never collects item-level evidence for these (a
+    // comparative judgment across two sets of pages, not a single sourced claim), so it
+    // must never read as a sourced fact; c.statementType is server-forced to
+    // "storymap_inference" for every live contrast regardless of the model's phrasing.
+    const badge = state.caseId === "live" && c.statementType ? statementTypeBadge(c.statementType) : null;
+    row.innerHTML = `
+      <div>
+        <b>${escapeHtml(c.competitor)}</b>
+        ${badge ? `<span class="${badge.className}">${badge.label}</span>` : ""}
+      </div>
+      <span class="muted">${escapeHtml(c.contrast)}</span>
+      ${badge ? `<span class="muted small">No item-level evidence — provisional comparison, not a sourced fact.</span>` : ""}
+    `;
     contrastList.appendChild(row);
   });
 

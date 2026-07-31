@@ -17,6 +17,7 @@ import { WIX_DATASET } from "./cases/wix-case-data.js";
 import { HPS_DATASET } from "./cases/hps-case-data.js";
 import { NO_DIRECT_EVIDENCE_CONFIDENCE } from "./case-utils.js";
 import { buildEvidenceIndex } from "./evidence.js";
+import { liveAnalysisService } from "./live-analysis-service.js";
 
 function resolveAfter(value, ms = 120) {
   return new Promise((resolve) => setTimeout(() => resolve(value), ms));
@@ -252,6 +253,11 @@ function createAnalysisService(dataset) {
 const SERVICES_BY_CASE = {
   wix: createAnalysisService(WIX_DATASET),
   hps: createAnalysisService(HPS_DATASET),
+  // Not built from createAnalysisService(dataset) like the seeded cases — there's no
+  // static dataset to run the 9-stage pipeline over here. liveAnalysisService implements
+  // the same method surface itself, backed by a completed backend job instead of a
+  // pre-validated seed file; see live-analysis-service.js's own docstring.
+  live: liveAnalysisService,
 };
 
 export function getAnalysisService(caseId) {

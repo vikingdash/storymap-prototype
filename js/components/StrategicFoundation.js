@@ -12,6 +12,7 @@
 // foundation" action sits at the bottom of the viewport throughout the review.
 import { statementTypeBadge, confidencePercent, escapeHtml } from "../labels.js";
 import { getState, setApproval, setDecisionResponse, setFoundationConfirmed } from "../state.js";
+import { regenerateAnalysis } from "../live-analysis-service.js";
 
 const TYPE_GROUPS = [
   { type: "customer", title: "Chosen customers" },
@@ -60,6 +61,10 @@ export async function renderStrategicFoundation(container, { service, state, dra
     </div>
     <div class="confirm-footer">
       <p class="muted small" data-role="confirm-summary"></p>
+      ${state.caseId === "live" ? `
+        <p class="muted small" data-role="regenerate-status"></p>
+        <button class="pill-button" type="button" data-action="regenerate">Regenerate analysis</button>
+      ` : ""}
       <button class="primary-button" type="button" data-action="confirm">Confirm strategic foundation →</button>
     </div>
   `;
@@ -88,6 +93,40 @@ export async function renderStrategicFoundation(container, { service, state, dra
     setFoundationConfirmed(true);
     onNavigate("diagnosis");
   });
+
+  // Live case only — the ONLY trigger for downstream regeneration. Never fires on a
+  // keystroke or an individual edit/reject action above; the user must explicitly click
+  // this after making whatever edits they want.
+  const regenerateBtn = container.querySelector('[data-action="regenerate"]');
+  if (regenerateBtn) {
+    const statusEl = container.querySelector('[data-role="regenerate-status"]');
+    regenerateBtn.addEventListener("click", async () => {
+      const current = getState();
+      const editedFoundation = choices
+        .filter((c) => current.approvals[c.id] !== "rejected")
+        .map((c) => ({ ...c, statement: current.edits[c.id] ?? c.statement }));
+
+      regenerateBtn.disabled = true;
+      regenerateBtn.textContent = "Regenerating…";
+      statusEl.textContent = "";
+      statusEl.style.color = "";
+      try {
+        const status = await regenerateAnalysis(editedFoundation);
+        if (status.status === "failed") {
+          statusEl.textContent = status.error || "Regeneration failed.";
+          statusEl.style.color = "var(--red)";
+        } else {
+          statusEl.textContent = "Done — diagnosis, narrative choices and recommendation now reflect your edits.";
+        }
+      } catch (err) {
+        statusEl.textContent = err instanceof Error ? err.message : String(err);
+        statusEl.style.color = "var(--red)";
+      } finally {
+        regenerateBtn.disabled = false;
+        regenerateBtn.textContent = "Regenerate analysis";
+      }
+    });
+  }
 }
 
 // Confidence already reflects how well the linked evidence (weighted by relevance and strength)

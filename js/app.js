@@ -6,6 +6,7 @@ import { getState, subscribe, setScreen, setCase, restart } from "./state.js";
 import { renderWorkflowNav, SCREENS } from "./components/WorkflowNav.js";
 import { mountEvidenceDrawer } from "./components/EvidenceDrawer.js";
 import { renderDemoIntro } from "./components/DemoIntro.js";
+import { renderAnalyzeCompany } from "./components/AnalyzeCompany.js";
 import { renderStrategicFoundation } from "./components/StrategicFoundation.js";
 import { renderDiagnosis } from "./components/Diagnosis.js";
 import { renderNarrativeChoices } from "./components/NarrativeChoices.js";
@@ -15,6 +16,7 @@ import { renderEvidenceRoom } from "./components/EvidenceRoom.js";
 
 const SCREEN_RENDERERS = {
   intro: renderDemoIntro,
+  analyze: renderAnalyzeCompany,
   foundation: renderStrategicFoundation,
   diagnosis: renderDiagnosis,
   choices: renderNarrativeChoices,
@@ -23,7 +25,7 @@ const SCREEN_RENDERERS = {
   evidence: renderEvidenceRoom,
 };
 
-const VALID_SCREENS = new Set(["intro", ...SCREENS.map((s) => s.id)]);
+const VALID_SCREENS = new Set(["intro", "analyze", ...SCREENS.map((s) => s.id)]);
 
 const navRoot = document.getElementById("workflow-nav");
 const screenRoot = document.getElementById("screen-root");
@@ -48,7 +50,7 @@ function navigate(screenId, { pushHash = true } = {}) {
 
 async function renderCurrentScreen() {
   const state = getState();
-  navRoot.style.display = state.screen === "intro" ? "none" : "flex";
+  navRoot.style.display = state.screen === "intro" || state.screen === "analyze" ? "none" : "flex";
   renderWorkflowNav(navRoot, {
     state,
     onNavigate: (id) => navigate(id),
@@ -66,7 +68,7 @@ async function renderCurrentScreen() {
       service: getAnalysisService(state.caseId),
       state,
       drawer,
-      onStart: () => navigate("foundation"),
+      onStart: () => navigate(state.caseId === "live" ? "analyze" : "foundation"),
       onNavigate: (id) => navigate(id),
       onSelectCase: (caseId) => setCase(caseId),
     });

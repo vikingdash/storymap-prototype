@@ -1,0 +1,6 @@
+flask
+requests
+trafilatura
+beautifulsoup4
+lxml
+python-dotenv

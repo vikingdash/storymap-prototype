@@ -9,6 +9,7 @@
 // link that jumps to that screen — not raw internal ids or clipped text. Filters narrow by
 // source type, company the source is about, and which screen it supports.
 import { strengthLabel, freshnessLabel, confidencePercent, escapeHtml } from "../labels.js";
+import { getLastDiagnostics } from "../live-analysis-service.js";
 
 const SOURCE_TYPE_LABELS = {
   internal: "Internal document",
@@ -31,10 +32,53 @@ const SCREEN_LABELS = {
 function inferCompany(source) {
   if (source.id.startsWith("src_webflow")) return "Webflow";
   if (source.id.startsWith("src_squarespace")) return "Squarespace";
+  // Live-flow sources always use the "src_live_" id prefix (pipeline_runner.py) — a
+  // prefix Wix/HPS never use — so this branch can never fire for the seeded cases and
+  // their existing grouping below (including HPS's sources, which all fall through to
+  // "Wix" today) is untouched.
+  if (source.id.startsWith("src_live_")) return source.publisher || "This company";
   return "Wix";
 }
 
-export async function renderEvidenceRoom(container, { service, onNavigate }) {
+// Live-only: rejected_records/dropped_links/statement_type_violations only ever exist in
+// diagnostics for the live "Analyze a company" flow (see backend/pipeline_runner.py) —
+// Wix/HPS have no such diagnostics object at all, so getLastDiagnostics() and this whole
+// panel are only ever consulted behind the caseId === "live" gate below. The exact key
+// set present varies by which action last touched the job (a full analyze vs. a
+// regenerate vs. a manual retry persist different subsets — see jobs.py), so every field
+// is read with a defensive fallback, never assumed present.
+function buildDataQualityPanel() {
+  const diagnostics = getLastDiagnostics();
+  if (!diagnostics) return "";
+  const rejected = diagnostics.rejected_records || [];
+  const dropped = diagnostics.dropped_links || [];
+  const downgrades = diagnostics.statement_type_violations || [];
+  if (!rejected.length && !dropped.length && !downgrades.length) return "";
+
+  const rejectedItems = rejected.map((r) => {
+    const label = r.id ? `${escapeHtml(r.stage || "")} (${escapeHtml(r.id)})` : escapeHtml(r.stage || "");
+    return `<li><strong>${label}:</strong> ${escapeHtml((r.reasons || []).join("; "))}</li>`;
+  }).join("");
+  const droppedItems = dropped.map((d) => {
+    const where = d.evidenceId ? `evidence ${escapeHtml(d.evidenceId)}` : `record ${escapeHtml(d.recordId || "")}`;
+    return `<li><strong>${escapeHtml(d.stage || "")}</strong> (${where}): ${escapeHtml(d.reason || "")}</li>`;
+  }).join("");
+  const downgradeItems = downgrades.map((v) => `<li>${escapeHtml(v)}</li>`).join("");
+
+  return `
+    <section class="card notice-card" data-role="data-quality-panel">
+      <details>
+        <summary>Data quality notes <span class="needs-review-badge" title="Records StoryMap rejected, dropped, or downgraded rather than presenting with false confidence">${rejected.length + dropped.length + downgrades.length}</span></summary>
+        <p class="muted small">StoryMap rejects or downgrades anything it can't fully verify or classify with confidence, rather than presenting it as more certain than it is.</p>
+        ${rejected.length ? `<h4>Rejected records</h4><ul class="numbered-list">${rejectedItems}</ul>` : ""}
+        ${dropped.length ? `<h4>Dropped evidence links</h4><ul class="numbered-list">${droppedItems}</ul>` : ""}
+        ${downgrades.length ? `<h4>Classification downgrades</h4><ul class="numbered-list">${downgradeItems}</ul>` : ""}
+      </details>
+    </section>
+  `;
+}
+
+export async function renderEvidenceRoom(container, { service, state, onNavigate }) {
   container.innerHTML = `<div class="loading">Opening the evidence room…</div>`;
   const [index, foundation, diagnosis, candidates, map] = await Promise.all([
     service.getEvidenceIndex(),
@@ -48,6 +92,9 @@ export async function renderEvidenceRoom(container, { service, onNavigate }) {
 
   const sourceTypes = [...new Set(bundles.map((b) => b.source.sourceType))];
   const companies = [...new Set(bundles.map((b) => b.company))];
+  // Only the live flow ever has this data at all — see buildDataQualityPanel's own
+  // internal empty-check too, so this is a double guard, not a single point of failure.
+  const dataQualityPanel = state?.caseId === "live" ? buildDataQualityPanel() : "";
 
   container.innerHTML = `
     <section class="screen-header">
@@ -55,6 +102,7 @@ export async function renderEvidenceRoom(container, { service, onNavigate }) {
       <h1>Every source behind this analysis</h1>
       <p class="lead">The prototype separates sourced facts from StoryMap's interpretation. Every material statement on every screen traces back to one of these sources.</p>
     </section>
+    ${dataQualityPanel}
     <div class="card evidence-filters">
       <label>Source type
         <select data-filter="sourceType">
@@ -117,7 +165,9 @@ function buildSupportsInfoMap(foundation, diagnosis, candidates, map) {
   foundation.forEach((c) => info.set(c.id, { screen: "foundation", title: c.statement }));
   diagnosis.forEach((f) => info.set(f.id, { screen: "diagnosis", title: f.title }));
   candidates.forEach((c) => info.set(c.id, { screen: "choices", title: c.name }));
-  map.coreClaims.forEach((claim) => info.set(claim.id, { screen: "map", title: claim.statement }));
+  // map is null in the live flow's zero-candidate-passed state (see Recommendation.js's
+  // matching guard) — never null for the seeded cases.
+  (map?.coreClaims || []).forEach((claim) => info.set(claim.id, { screen: "map", title: claim.statement }));
   return info;
 }
 

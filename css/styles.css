@@ -366,3 +366,25 @@ h4 { font-size: 14px; margin: 14px 0 6px; color: var(--text); }
   .evidence-filters { flex-direction: column; gap: 12px; }
   .evidence-filters select { width: 100%; }
 }
+
+/* ---------- Analyze a company (live flow) — functional styling only, matches existing patterns ---------- */
+.field-label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 6px; }
+.text-input {
+  width: 100%;
+  background: var(--panel3);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  font-family: inherit;
+  font-size: 14px;
+  box-sizing: border-box;
+}
+.url-row { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+.url-row .text-input { flex: 1; }
+.stage-list { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.stage-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); color: var(--muted); }
+.stage-row.stage-active { border-color: var(--orange); color: var(--text); background: var(--panel2); }
+.stage-row.stage-done { color: var(--green); border-color: var(--green); }
+.stage-icon { width: 18px; text-align: center; font-weight: bold; }
+.live-flow-tag { border: 1px solid var(--yellow); color: var(--yellow); background: transparent; margin-left: 8px; }

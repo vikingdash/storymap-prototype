@@ -2,3 +2,5 @@
 .claude/
 __pycache__/
 *.pyc
+.env
+backend/job_state/

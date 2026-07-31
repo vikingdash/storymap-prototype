@@ -30,7 +30,7 @@ function defaultCaseState() {
 const DEFAULT_STATE = {
   screen: "intro",
   caseId: "wix",
-  cases: { wix: defaultCaseState(), hps: defaultCaseState() },
+  cases: { wix: defaultCaseState(), hps: defaultCaseState(), live: defaultCaseState() },
 };
 
 function load() {
@@ -143,6 +143,6 @@ export function setNarrativeApproved(approved) {
 
 export function restart() {
   localStorage.removeItem(STORAGE_KEY);
-  state = { ...DEFAULT_STATE, cases: { wix: defaultCaseState(), hps: defaultCaseState() } };
+  state = { ...DEFAULT_STATE, cases: { wix: defaultCaseState(), hps: defaultCaseState(), live: defaultCaseState() } };
   notify();
 }
