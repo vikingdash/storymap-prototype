@@ -50,3 +50,28 @@ NON_UNRESOLVED_ALLOWED_STATEMENT_TYPES = {"source_fact", "storymap_inference", "
 # schema anyway — the same two-layer pattern used throughout this file.
 DIAGNOSIS_STATEMENT_TYPE_ENUM = ["source_fact", "storymap_inference", "storymap_synthesis", "aspiration"]
 DIAGNOSIS_ALLOWED_STATEMENT_TYPES = set(DIAGNOSIS_STATEMENT_TYPE_ENUM)
+
+# What an uploaded internal .docx document IS, in the analysis — set once by the user at
+# upload time (AnalyzeCompany.js), never inferred by the model. Saved directly on the
+# source's own "documentRole" field (jobs.py/document_extractor.py), passed through
+# unchanged by every pipeline stage exactly like sourceType, and rendered in the Evidence
+# Room (js/labels.js's DOCUMENT_ROLE_LABELS mirrors this list's display text).
+DOCUMENT_ROLES = [
+    "current_draft_narrative",
+    "strategy_or_business_plan",
+    "customer_research",
+    "proof_or_performance_evidence",
+    "investor_or_financial_material",
+    "existing_messaging",
+    "other_internal_context",
+]
+
+DOCUMENT_ROLE_LABELS = {
+    "current_draft_narrative": "Current draft corporate narrative",
+    "strategy_or_business_plan": "Strategy or business plan",
+    "customer_research": "Customer research",
+    "proof_or_performance_evidence": "Proof or performance evidence",
+    "investor_or_financial_material": "Investor or financial material",
+    "existing_messaging": "Existing messaging",
+    "other_internal_context": "Other internal context",
+}

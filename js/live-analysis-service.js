@@ -12,7 +12,12 @@
 // needs to persist across a reload the way workflow progress does.
 import { buildEvidenceIndex } from "./evidence.js";
 
-const BACKEND_BASE = "http://127.0.0.1:5055";
+// Derived from the browser's own address rather than hardcoded, so the same build works
+// unmodified whether the page was opened as localhost, 127.0.0.1, or a LAN IP (e.g. a
+// second device on the same Wi-Fi testing against a backend started with
+// STORYMAP_HOST=0.0.0.0 — see backend/app.py's docstring). The backend always runs on
+// the same host as the frontend in every supported setup, only the port differs.
+const BACKEND_BASE = `http://${window.location.hostname}:5055`;
 const POLL_INTERVAL_MS = 1500;
 const HEALTH_CHECK_TIMEOUT_MS = 2500;
 
@@ -46,11 +51,17 @@ function withTimeout(promise, ms) {
 }
 
 async function backendFetch(path, options = {}) {
+  // A FormData body (internal-document uploads — see startAnalysis) must NOT get an
+  // explicit Content-Type: the browser sets its own multipart boundary parameter
+  // automatically only when it's left unset; forcing application/json here would break
+  // Flask's multipart parsing. Every existing caller passes a JSON string body (or none),
+  // so this branch is a no-op for all of them — behavior is unchanged.
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
   let response;
   try {
     response = await fetch(`${BACKEND_BASE}${path}`, {
-      headers: { "Content-Type": "application/json" },
       ...options,
+      headers: isFormData ? options.headers : { "Content-Type": "application/json", ...options.headers },
     });
   } catch (err) {
     throw new Error(
@@ -77,11 +88,30 @@ export async function checkBackendAvailable() {
   }
 }
 
-export async function startAnalysis({ companyUrl, supportingUrls, competitorUrls, existingNarrative }) {
-  const { jobId } = await backendFetch("/api/analyze-company", {
-    method: "POST",
-    body: JSON.stringify({ companyUrl, supportingUrls, competitorUrls, existingNarrative }),
-  });
+// internalDocuments: optional array of {file: File, role: string} — AnalyzeCompany.js is
+// the only caller that ever populates it. Empty/omitted takes the exact same JSON-body
+// path this always used, byte-for-byte — only a non-empty list switches to a
+// multipart/form-data body (files can't be JSON-encoded). The backend expects one JSON
+// "meta" field (the same companyUrl/supportingUrls/competitorUrls/existingNarrative
+// shape as the plain-JSON path, plus internalDocumentRoles index-matched to the file
+// parts) alongside indexed internalDocument_0, internalDocument_1, ... file parts — see
+// backend/app.py's analyze_company().
+export async function startAnalysis({ companyUrl, supportingUrls, competitorUrls, existingNarrative, internalDocuments = [] }) {
+  let jobId;
+  if (internalDocuments.length) {
+    const formData = new FormData();
+    formData.append("meta", JSON.stringify({
+      companyUrl, supportingUrls, competitorUrls, existingNarrative,
+      internalDocumentRoles: internalDocuments.map((d) => d.role),
+    }));
+    internalDocuments.forEach((d, i) => formData.append(`internalDocument_${i}`, d.file, d.file.name));
+    ({ jobId } = await backendFetch("/api/analyze-company", { method: "POST", body: formData }));
+  } else {
+    ({ jobId } = await backendFetch("/api/analyze-company", {
+      method: "POST",
+      body: JSON.stringify({ companyUrl, supportingUrls, competitorUrls, existingNarrative }),
+    }));
+  }
   currentJobId = jobId;
   originalIntake = { companyUrl, supportingUrls, competitorUrls, existingNarrative };
   return jobId;

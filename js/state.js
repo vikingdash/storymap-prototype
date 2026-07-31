@@ -23,7 +23,7 @@ function defaultCaseState() {
     edits: {}, // { [strategicChoiceId]: string } user-edited statement text
     decisionResponses: {}, // { [strategicChoiceId]: { response: string, deferred: boolean } } — leadership decisions
     foundationConfirmed: false,
-    narrativeApproved: false, // user clicked "Approve as provisional narrative" on the Narrative Map screen
+    narrativeApproved: false, // user clicked "Save as working narrative" on the Narrative Map screen
   };
 }
 

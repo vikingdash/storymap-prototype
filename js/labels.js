@@ -42,6 +42,10 @@ export function relevanceLabel(relevance) {
     partial: "chip chip-moderate",
     context: "chip",
     conflicting: "chip chip-unsupported",
+    // Same visual weight as "partial" — never as certain-looking as "direct" (chip-strong).
+    // Only ever appears on live-flow evidence the backend downgraded from "direct" because
+    // it came from the current draft narrative; Wix/HPS never produce this value.
+    company_position: "chip chip-moderate",
   }[relevance] || "chip";
   return { label, className };
 }
@@ -53,6 +57,21 @@ export function freshnessLabel(freshness) {
     stale: { label: "Stale", className: "chip chip-stale" },
   }[freshness] || { label: freshness, className: "chip" };
 }
+
+// Human labels for the live "Analyze a company" flow's internal-document upload feature
+// (backend/schema_constants.DOCUMENT_ROLES/DOCUMENT_ROLE_LABELS — kept in sync by hand,
+// same convention as every other label map here). A source's documentRole is only ever
+// set for sourceType "internal" uploads (AnalyzeCompany.js/EvidenceRoom.js); undefined
+// for every other source, including every Wix/HPS source.
+export const DOCUMENT_ROLE_LABELS = {
+  current_draft_narrative: "Current draft corporate narrative",
+  strategy_or_business_plan: "Strategy or business plan",
+  customer_research: "Customer research",
+  proof_or_performance_evidence: "Proof or performance evidence",
+  investor_or_financial_material: "Investor or financial material",
+  existing_messaging: "Existing messaging",
+  other_internal_context: "Other internal context",
+};
 
 export function confidencePercent(confidence) {
   return `${Math.round(confidence * 100)}%`;

@@ -8,11 +8,11 @@
 // grouped by which screen it appears on, with the exact claim/finding title (not truncated) as a
 // link that jumps to that screen — not raw internal ids or clipped text. Filters narrow by
 // source type, company the source is about, and which screen it supports.
-import { strengthLabel, freshnessLabel, confidencePercent, escapeHtml } from "../labels.js";
+import { strengthLabel, freshnessLabel, confidencePercent, escapeHtml, DOCUMENT_ROLE_LABELS } from "../labels.js";
 import { getLastDiagnostics } from "../live-analysis-service.js";
 
 const SOURCE_TYPE_LABELS = {
-  internal: "Internal document",
+  internal: "Internal company document",
   website: "Company website",
   press_release: "Press release",
   earnings: "Earnings report",
@@ -95,6 +95,11 @@ export async function renderEvidenceRoom(container, { service, state, onNavigate
   // Only the live flow ever has this data at all — see buildDataQualityPanel's own
   // internal empty-check too, so this is a double guard, not a single point of failure.
   const dataQualityPanel = state?.caseId === "live" ? buildDataQualityPanel() : "";
+  // Live-only: keeps uploaded internal documents visually separate from public web
+  // sources rather than mixed into one list distinguished only by a small type label.
+  // Wix/HPS never have sourceType "internal" and always render the single unlabeled
+  // list exactly as before — this branch only ever changes anything for caseId "live".
+  const splitBySourceType = state?.caseId === "live";
 
   container.innerHTML = `
     <section class="screen-header">
@@ -123,20 +128,28 @@ export async function renderEvidenceRoom(container, { service, state, onNavigate
         </select>
       </label>
     </div>
-    <div class="evidence-room-list" data-role="evidence-room-list"></div>
+    ${splitBySourceType ? `
+      <h2>Public sources</h2>
+      <div class="evidence-room-list" data-role="evidence-room-list-public"></div>
+      <h2>Internal company documents</h2>
+      <p class="muted small" data-role="internal-empty-note">No internal documents were uploaded for this analysis.</p>
+      <div class="evidence-room-list" data-role="evidence-room-list-internal"></div>
+    ` : `
+      <div class="evidence-room-list" data-role="evidence-room-list"></div>
+    `}
     <p class="muted small" data-role="empty-note" style="display:none">No sources match these filters.</p>
     <div class="screen-footer">
       <p class="muted small">You've reached the end of the guided workflow. Use the steps above to revisit any screen, or restart the demo.</p>
     </div>
   `;
 
-  const list = container.querySelector('[data-role="evidence-room-list"]');
   const emptyNote = container.querySelector('[data-role="empty-note"]');
   const filters = { sourceType: "", company: "", screen: "" };
 
-  function applyFilters() {
-    list.innerHTML = "";
-    let shown = 0;
+  // Every bundle that survives the current filters, each with its filtered-down evidence
+  // list — the two rendering modes below just decide WHERE to put each one.
+  function computeVisibleBundles() {
+    const result = [];
     bundles.forEach(({ source, evidence, company }) => {
       if (filters.sourceType && source.sourceType !== filters.sourceType) return;
       if (filters.company && company !== filters.company) return;
@@ -144,10 +157,35 @@ export async function renderEvidenceRoom(container, { service, state, onNavigate
         ? evidence.filter((ev) => ev.supportsIds.some((id) => supportsInfo.get(id)?.screen === filters.screen))
         : evidence;
       if (!visibleEvidence.length) return;
-      shown++;
-      list.appendChild(renderSourceBlock(source, visibleEvidence, supportsInfo, onNavigate));
+      result.push({ source, visibleEvidence });
     });
-    emptyNote.style.display = shown ? "none" : "block";
+    return result;
+  }
+
+  function applyFilters() {
+    const visible = computeVisibleBundles();
+    if (splitBySourceType) {
+      const publicList = container.querySelector('[data-role="evidence-room-list-public"]');
+      const internalList = container.querySelector('[data-role="evidence-room-list-internal"]');
+      publicList.innerHTML = "";
+      internalList.innerHTML = "";
+      let internalShown = 0;
+      visible.forEach(({ source, visibleEvidence }) => {
+        const block = renderSourceBlock(source, visibleEvidence, supportsInfo, onNavigate);
+        if (source.sourceType === "internal") {
+          internalList.appendChild(block);
+          internalShown++;
+        } else {
+          publicList.appendChild(block);
+        }
+      });
+      container.querySelector('[data-role="internal-empty-note"]').style.display = internalShown ? "none" : "block";
+    } else {
+      const list = container.querySelector('[data-role="evidence-room-list"]');
+      list.innerHTML = "";
+      visible.forEach(({ source, visibleEvidence }) => list.appendChild(renderSourceBlock(source, visibleEvidence, supportsInfo, onNavigate)));
+    }
+    emptyNote.style.display = visible.length ? "none" : "block";
   }
 
   container.querySelectorAll("[data-filter]").forEach((select) => {
@@ -175,10 +213,14 @@ function renderSourceBlock(source, evidenceItems, supportsInfo, onNavigate) {
   const el = document.createElement("div");
   el.className = "card source-block";
   const count = evidenceItems.length;
+  // documentRole only ever exists on an uploaded internal document's source record (see
+  // backend/document_extractor.documents_to_sources) — undefined, and so silently
+  // omitted, for every web-fetched or seeded Wix/HPS source.
+  const roleLabel = source.documentRole ? (DOCUMENT_ROLE_LABELS[source.documentRole] || source.documentRole) : null;
   el.innerHTML = `
     <div class="source-block-header">
       <div>
-        <div class="meta-line">${escapeHtml(source.publisher || "")} · ${escapeHtml(source.publishedAt || "Undated")} · ${escapeHtml(SOURCE_TYPE_LABELS[source.sourceType] || source.sourceType)} · ${count} piece${count === 1 ? "" : "s"} of evidence</div>
+        <div class="meta-line">${escapeHtml(source.publisher || "")} · ${escapeHtml(source.publishedAt || "Undated")} · ${escapeHtml(SOURCE_TYPE_LABELS[source.sourceType] || source.sourceType)}${roleLabel ? ` · ${escapeHtml(roleLabel)}` : ""} · ${count} piece${count === 1 ? "" : "s"} of evidence</div>
         <h3>${escapeHtml(source.title)}</h3>
       </div>
       ${source.url ? `<a class="source-link" href="${escapeHtml(source.url)}" target="_blank" rel="noopener">Open official source ↗</a>` : ""}
@@ -206,6 +248,7 @@ function renderEvidenceRow(ev, supportsInfo, onNavigate) {
     </div>
     <blockquote>&ldquo;${escapeHtml(ev.excerpt)}&rdquo;</blockquote>
     <p class="muted"><strong>StoryMap paraphrase:</strong> ${escapeHtml(ev.paraphrase)}</p>
+    ${ev.scope ? `<p class="muted small"><strong>Location:</strong> ${escapeHtml(ev.scope)}</p>` : ""}
     <div class="supports-groups" data-role="supports-groups"></div>
   `;
   const groupsEl = row.querySelector('[data-role="supports-groups"]');

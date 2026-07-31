@@ -5,7 +5,7 @@
 // disabled, never a raw network-error page (matters most on the public GitHub Pages
 // build, which has no backend at all); (2) intake form; (3) stage-by-stage progress while
 // a job runs. On completion, hands off to the normal screen flow starting at "foundation".
-import { escapeHtml } from "../labels.js";
+import { escapeHtml, DOCUMENT_ROLE_LABELS } from "../labels.js";
 import { checkBackendAvailable, startAnalysis, pollJob, retryStage, getStageProgress } from "../live-analysis-service.js";
 
 const STAGE_LABELS = {
@@ -20,6 +20,15 @@ const STAGE_ORDER = Object.keys(STAGE_LABELS);
 
 const MAX_SUPPORTING = 5;
 const MAX_COMPETITOR = 3;
+// Same cap as backend/app.py's MAX_INTERNAL_DOCUMENTS — mirrored locally rather than
+// imported, same convention already used for MAX_SUPPORTING/MAX_COMPETITOR above (this
+// file has no build step to share a constant with the backend across the network
+// boundary; the server re-enforces this regardless, this is just the client-side UX cap).
+const MAX_INTERNAL_DOCUMENTS = 5;
+const MAX_UPLOAD_FILE_BYTES = 20 * 1024 * 1024;
+const DOCUMENT_ROLE_OPTIONS = Object.entries(DOCUMENT_ROLE_LABELS)
+  .map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`)
+  .join("");
 
 export async function renderAnalyzeCompany(container, { onNavigate }) {
   container.innerHTML = `<div class="loading">Checking local backend…</div>`;
@@ -34,7 +43,7 @@ export async function renderAnalyzeCompany(container, { onNavigate }) {
 
     <section class="card notice-card">
       <div class="eyebrow eyebrow-muted">Important context</div>
-      <p>This analysis is <strong>provisional</strong>. It is built only from the public sources you provide — it has no access to internal strategy, customer research, or proprietary data. Claims without direct evidence are labeled as such, not presented with false confidence.</p>
+      <p>This analysis is <strong>provisional</strong>. It is built from the public sources you provide, plus any internal documents you optionally upload below — it has no other access to internal strategy, customer research, or proprietary data. Claims without direct evidence are labeled as such, not presented with false confidence.</p>
     </section>
 
     ${backendAvailable ? "" : `
@@ -61,6 +70,11 @@ export async function renderAnalyzeCompany(container, { onNavigate }) {
       <div data-role="competitor-list"></div>
       <button type="button" class="pill-button" data-action="add-competitor" ${backendAvailable ? "" : "disabled"}>+ Add competitor URL</button>
 
+      <h2>Internal documents <span class="muted small">(up to ${MAX_INTERNAL_DOCUMENTS}, optional, .docx only)</span></h2>
+      <p class="muted small">Stored only on this Mac, only for this analysis — never committed to Git, never sent anywhere except this local backend. Each document needs a role so StoryMap knows what kind of internal material it is.</p>
+      <div data-role="internal-document-list"></div>
+      <button type="button" class="pill-button" data-action="add-internal-document" ${backendAvailable ? "" : "disabled"}>+ Add internal document</button>
+
       <p class="muted small" data-role="form-error" style="display:none;color:var(--red)"></p>
 
       <div class="intro-cta">
@@ -83,6 +97,7 @@ export async function renderAnalyzeCompany(container, { onNavigate }) {
 
   const supportingListEl = container.querySelector('[data-role="supporting-list"]');
   const competitorListEl = container.querySelector('[data-role="competitor-list"]');
+  const internalDocumentListEl = container.querySelector('[data-role="internal-document-list"]');
 
   function addUrlRow(listEl, field, disabled) {
     if (listEl.children.length >= (field === "supporting" ? MAX_SUPPORTING : MAX_COMPETITOR)) return;
@@ -96,8 +111,28 @@ export async function renderAnalyzeCompany(container, { onNavigate }) {
     listEl.appendChild(row);
   }
 
+  // One row = one file + its required role, mirroring the url-row pattern above rather
+  // than a bare multi-select file picker — a role has to be chosen per file, not once for
+  // the whole batch, so each file needs its own row anyway.
+  function addDocumentRow(disabled) {
+    if (internalDocumentListEl.children.length >= MAX_INTERNAL_DOCUMENTS) return;
+    const row = document.createElement("div");
+    row.className = "url-row";
+    row.innerHTML = `
+      <input type="file" class="text-input" data-field="internalDocumentFile" accept=".docx" ${disabled ? "disabled" : ""} />
+      <select class="text-input" data-field="internalDocumentRole" ${disabled ? "disabled" : ""}>
+        <option value="" disabled selected>Select a role…</option>
+        ${DOCUMENT_ROLE_OPTIONS}
+      </select>
+      <button type="button" class="text-link" data-action="remove-row">Remove</button>
+    `;
+    row.querySelector('[data-action="remove-row"]').addEventListener("click", () => row.remove());
+    internalDocumentListEl.appendChild(row);
+  }
+
   container.querySelector('[data-action="add-supporting"]')?.addEventListener("click", () => addUrlRow(supportingListEl, "supporting", !backendAvailable));
   container.querySelector('[data-action="add-competitor"]')?.addEventListener("click", () => addUrlRow(competitorListEl, "competitor", !backendAvailable));
+  container.querySelector('[data-action="add-internal-document"]')?.addEventListener("click", () => addDocumentRow(!backendAvailable));
 
   if (backendAvailable) {
     addUrlRow(supportingListEl, "supporting", false);
@@ -117,6 +152,31 @@ export async function renderAnalyzeCompany(container, { onNavigate }) {
     return Array.from(container.querySelectorAll(`[data-field="${field}Url"]`))
       .map((input) => input.value.trim())
       .filter(Boolean);
+  }
+
+  // Client-side checks are a fast, friendly first pass only — the backend re-validates
+  // everything (extension, magic bytes, size, password/corruption/emptiness) regardless,
+  // since a client check can always be bypassed or simply wrong (e.g. a renamed file).
+  // Throws on the first problem found; the caller shows it as a single form error.
+  function collectInternalDocuments() {
+    const fileInputs = Array.from(container.querySelectorAll('[data-field="internalDocumentFile"]'));
+    const documents = [];
+    for (const fileInput of fileInputs) {
+      const file = fileInput.files[0];
+      if (!file) continue; // a row added but never given a file is silently skipped, not an error
+      const role = fileInput.closest(".url-row").querySelector('[data-field="internalDocumentRole"]').value;
+      if (!/\.docx$/i.test(file.name)) {
+        throw new Error(`"${file.name}": only .docx files are supported.`);
+      }
+      if (file.size > MAX_UPLOAD_FILE_BYTES) {
+        throw new Error(`"${file.name}" is larger than the ${MAX_UPLOAD_FILE_BYTES / (1024 * 1024)}MB limit.`);
+      }
+      if (!role) {
+        throw new Error(`Select a document role for "${file.name}" before submitting.`);
+      }
+      documents.push({ file, role });
+    }
+    return documents;
   }
 
   function renderStageList(currentStage) {
@@ -224,13 +284,22 @@ export async function renderAnalyzeCompany(container, { onNavigate }) {
     const competitorUrls = collectUrls("competitor");
     const existingNarrative = container.querySelector('[data-field="existingNarrative"]').value.trim();
 
+    let internalDocuments;
+    try {
+      internalDocuments = collectInternalDocuments();
+    } catch (err) {
+      formErrorEl.textContent = err.message;
+      formErrorEl.style.display = "block";
+      return;
+    }
+
     submitBtn.disabled = true;
     formEl.style.opacity = "0.6";
     progressEl.style.display = "block";
     renderStageList(null);
 
     try {
-      const jobId = await startAnalysis({ companyUrl, supportingUrls, competitorUrls, existingNarrative });
+      const jobId = await startAnalysis({ companyUrl, supportingUrls, competitorUrls, existingNarrative, internalDocuments });
       const status = await pollJob(jobId, (s) => renderStageList(s.stage));
       if (status.status === "failed") {
         await handleFailure(status);

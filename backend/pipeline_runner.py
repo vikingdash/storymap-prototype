@@ -299,7 +299,7 @@ def fetch_all_sources(company_url, supporting_urls, competitor_urls, progress_cb
     return sources, source_text_by_id, fetch_failures, company_doc
 
 
-def merge_evidence(pool, new_items, stage_prefix, source_text_by_id, dropped_links_report, rejected_records_report):
+def merge_evidence(pool, new_items, stage_prefix, source_text_by_id, dropped_links_report, rejected_records_report, source_roles_by_id=None):
     id_map = {}
     valid_items = filter_malformed_records(new_items, EVIDENCE_ITEM_REQUIRED_KEYS, stage_prefix, rejected_records_report, "evidence item")
     for item in valid_items:
@@ -309,6 +309,12 @@ def merge_evidence(pool, new_items, stage_prefix, source_text_by_id, dropped_lin
         item["id"] = new_id
         source_text = source_text_by_id.get(item["sourceId"], "")
         item["verified"] = excerpt_is_verified(item["excerpt"], source_text)
+        # Stamped once, here, at creation — never asked of the model. This is what lets
+        # sanitize_links() decide, deterministically and later, whether a "direct"
+        # EvidenceLink pointing at this item needs to be downgraded to "company_position"
+        # (see sanitize_links's docstring) — a fact about WHERE the evidence came from,
+        # not something inferred from the excerpt text itself.
+        item["sourceDocumentRole"] = (source_roles_by_id or {}).get(item["sourceId"])
         # EvidenceItem.confidence (schemas.js) is "extraction confidence" — how sure
         # StoryMap is that this excerpt/paraphrase was captured correctly — not the
         # claim's truth (that's the separate statement-level confidence in
@@ -334,7 +340,25 @@ def remap_links(links, id_map):
             link["evidenceId"] = id_map[link["evidenceId"]]
 
 
+COMPANY_POSITION_RELEVANCE = "company_position"
+
+
 def sanitize_links(record_id, links, pool, stage, dropped_links_report):
+    """Citation verification (ev.get("verified")) is checked FIRST and is completely
+    unaffected by anything below it — an excerpt that isn't a real substring of its
+    source is dropped exactly as before, never reaching the relevance check at all.
+
+    Only after a link survives verification: if the model labeled it "direct" and its
+    evidence item came from a source with documentRole "current_draft_narrative" (stamped
+    once, at creation, by merge_evidence — never asked of the model), it is deterministically
+    downgraded to "company_position" here. This is never trusted to the model — a narrative
+    directly stating its own claim is not proof the claim is true, and confidence.py's
+    compute_confidence_from_links already only recognizes the literal strings "direct" and
+    "partial" as confidence-raising, so "company_position" is automatically excluded from
+    ever inflating a statement's confidence, by the exact same mechanism that already
+    excludes "context"/"conflicting" — no change needed there. partial/context/conflicting
+    links from a current_draft_narrative source are left exactly as the model labeled them;
+    only "direct" is ever ambiguous enough to need this."""
     if not isinstance(links, list):
         dropped_links_report.append({"stage": stage, "recordId": record_id, "evidenceId": None, "reason": f"expected a list of evidence links, got {type(links).__name__}"})
         return []
@@ -354,6 +378,8 @@ def sanitize_links(record_id, links, pool, stage, dropped_links_report):
         if not ev.get("verified", False):
             dropped_links_report.append({"stage": stage, "recordId": record_id, "evidenceId": eid, "reason": "excerpt failed server-side verification"})
             continue
+        if link.get("relevance") == "direct" and ev.get("sourceDocumentRole") == "current_draft_narrative":
+            link["relevance"] = COMPANY_POSITION_RELEVANCE
         kept.append(link)
     return kept
 
@@ -362,8 +388,8 @@ def sanitize_links(record_id, links, pool, stage, dropped_links_report):
 # --- named functions so run_analysis(), regenerate_from(), and every retry_xxx() share --
 # --- exactly one copy each, per "do not create separate ad hoc checks for each call site")
 
-def process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations):
-    id_map = merge_evidence(evidence_pool, response["evidence"], "f", source_text_by_id, dropped_links_report, rejected_records_report)
+def process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, has_current_draft_narrative=False, company_name=None, source_roles_by_id=None):
+    id_map = merge_evidence(evidence_pool, response["evidence"], "f", source_text_by_id, dropped_links_report, rejected_records_report, source_roles_by_id)
     kept = []
     raw_choices = filter_malformed_records(response["strategicFoundation"], STRATEGIC_CHOICE_REQUIRED_KEYS, "strategic_foundation", rejected_records_report, "strategic-foundation item")
     for choice in raw_choices:
@@ -378,11 +404,16 @@ def process_foundation_response(response, evidence_pool, source_text_by_id, drop
         choice["confidence"] = None if choice["type"] == "unresolved" else compute_confidence_from_links(choice["evidence"], evidence_pool)
         choice["approvalStatus"] = "unreviewed"
         kept.append(choice)
-    return kept
+    # .get() here, not response["narrativeQuestion"] — the tool schema marks this required
+    # (anthropic_pipeline.extract_foundation), but that's a prompt-level nudge, never a
+    # guarantee; resolve_narrative_question is what makes "undefined" structurally
+    # impossible regardless of what the model actually returned.
+    narrative_question = resolve_narrative_question(response.get("narrativeQuestion"), has_current_draft_narrative, company_name)
+    return kept, narrative_question
 
 
-def process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations):
-    id_map = merge_evidence(evidence_pool, response["evidence"], "d", source_text_by_id, dropped_links_report, rejected_records_report)
+def process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id=None):
+    id_map = merge_evidence(evidence_pool, response["evidence"], "d", source_text_by_id, dropped_links_report, rejected_records_report, source_roles_by_id)
     kept = []
     raw_findings = filter_malformed_records(response["diagnosis"], DIAGNOSIS_FINDING_REQUIRED_KEYS, "diagnosis", rejected_records_report, "diagnosis finding")
     for finding in raw_findings:
@@ -837,7 +868,67 @@ def build_case_context(company_doc):
     }
 
 
-def run_analysis(company_url, supporting_urls, competitor_urls, existing_narrative, progress_cb=lambda *_: None, persist_cb=lambda *_: None):
+PASTED_NARRATIVE_SOURCE_ID = "src_pasted_narrative"
+
+
+def sources_with_pasted_narrative(sources, source_text_by_id, existing_narrative):
+    """Folds pasted "Existing narrative" text into `sources`/`source_text_by_id` as a
+    synthetic source shaped exactly like an uploaded document with documentRole
+    "current_draft_narrative" — unifying pasted-text and uploaded-file treatment so every
+    downstream prompt/rule (role tagging in _format_sources, SYSTEM_RULES rule 11,
+    narrativeQuestion derivation) handles both identically, with zero special-casing
+    anywhere else. A no-op when existing_narrative is empty/whitespace, or when a source
+    with this synthetic id is already present (idempotent — safe to call again on every
+    entry point, including regenerate/retry paths that reuse an already-injected checkpoint,
+    without ever double-inserting).
+
+    Called at every place `sources`/`source_text_by_id` get assembled from a fresh state
+    (run_analysis, jobs.py's expand-sources dispatch) so the pseudo-source is durably
+    persisted into fetching_sources (and so visible in the Evidence Room, labeled "Internal
+    company document — Current draft corporate narrative", exactly like an uploaded file).
+    Also called defensively in regenerate_from/retry_extract_foundation/retry_diagnose,
+    which normally just reuse an already-injected checkpoint's sources — a cheap no-op
+    there today, but a safety net against ever silently losing role-awareness if a future
+    caller passes sources that were never injected."""
+    text = (existing_narrative or "").strip()
+    if not text or any(s.get("id") == PASTED_NARRATIVE_SOURCE_ID for s in sources):
+        return sources, source_text_by_id
+    pseudo_source = {
+        "id": PASTED_NARRATIVE_SOURCE_ID,
+        "companyId": "live",
+        "title": "Pasted existing narrative",
+        "publisher": "User-supplied",
+        "sourceType": "internal",
+        "documentRole": "current_draft_narrative",
+        "retrievedAt": now_iso(),
+        "permissionStatus": "approved",
+    }
+    return sources + [pseudo_source], {**source_text_by_id, PASTED_NARRATIVE_SOURCE_ID: text}
+
+
+# Values a model might emit that are technically non-empty strings but are placeholders,
+# not real questions — checked in addition to the missing/None/wrong-type/empty cases so
+# "never render ... an internal key" (the exact wording of the bug report) is covered too.
+_INVALID_NARRATIVE_QUESTION_VALUES = {"undefined", "null", "none", "n/a", "na", "tbd", "narrativequestion", ""}
+
+
+def resolve_narrative_question(raw_value, has_current_draft_narrative, company_name):
+    """The ONE place a bad narrativeQuestion ever gets fixed, regardless of exactly how it
+    was bad: missing (raw_value is None from response.get()), null (None from real JSON
+    null), malformed (wrong type — int/list/dict), empty ("" or whitespace-only), or a
+    placeholder-looking string a model sometimes emits instead of a real answer. Never
+    returns anything falsy or placeholder-shaped — always a real, human-readable question."""
+    if isinstance(raw_value, str):
+        cleaned = raw_value.strip()
+        if cleaned and cleaned.lower() not in _INVALID_NARRATIVE_QUESTION_VALUES:
+            return cleaned
+    name = company_name or "this company"
+    if has_current_draft_narrative:
+        return f"Is {name}'s current narrative the clearest, most credible way to describe what it does — and what would make it stronger?"
+    return f"What should {name} be known for, based on what's publicly verifiable?"
+
+
+def run_analysis(company_url, supporting_urls, competitor_urls, existing_narrative, progress_cb=lambda *_: None, persist_cb=lambda *_: None, uploaded_sources=(), uploaded_source_text_by_id=None):
     """Fetches sources for the FIRST time for a brand new job, then hands off to
     run_pipeline_from_sources() for everything from strategic_foundation onward — the two
     are split apart specifically so a second caller (jobs.py's expand-sources dispatch,
@@ -846,21 +937,39 @@ def run_analysis(company_url, supporting_urls, competitor_urls, existing_narrati
     run_pipeline_from_sources()'s docstring for the full behavior contract (partial
     results preserved on failure, persist_cb per stage, etc.) — this function's own
     contract is identical, it just also owns the initial fetch.
+
+    uploaded_sources/uploaded_source_text_by_id: already-validated, already-extracted
+    internal .docx documents (sourceType "internal" — see document_extractor.py and
+    jobs.py's "analyze" dispatch), shaped exactly like fetch_all_sources()'s own return
+    values and merged in here, BEFORE run_pipeline_from_sources() is ever called. Default
+    empty, so every existing caller (run_basecamp_test.py, every pre-upload test, an
+    analyze job with no uploaded documents) is completely unaffected. Merging at this one
+    point — rather than teaching run_pipeline_from_sources() or anything downstream about
+    file uploads — is what keeps every stage prompt, citation check, evidence merge, and
+    confidence computation identical regardless of whether a source came from a URL or a
+    file; none of that code ever needs to know the difference.
     """
     sources, source_text_by_id, fetch_failures, company_doc = fetch_all_sources(
         company_url, supporting_urls, competitor_urls, progress_cb
     )
     case_context = build_case_context(company_doc)
+    combined_sources = sources + list(uploaded_sources)
+    combined_source_text_by_id = {**source_text_by_id, **(uploaded_source_text_by_id or {})}
+    # Pasted "Existing narrative" text gets the exact same role-aware treatment as an
+    # uploaded document with documentRole "current_draft_narrative" — see
+    # sources_with_pasted_narrative's docstring. Injected here (before persist_cb) so the
+    # Evidence Room sees it too, not just the model prompts.
+    combined_sources, combined_source_text_by_id = sources_with_pasted_narrative(combined_sources, combined_source_text_by_id, existing_narrative)
     # sourceTextById is persisted here (not re-derivable from `sources` alone) so a later
     # manual retry of any downstream stage can rebuild its exact model inputs without
-    # re-fetching a single URL. caseContext is persisted here too — it's otherwise never
-    # stored anywhere durable, which would silently break dataset reconstruction from a
-    # checkpoint after a restart.
+    # re-fetching a single URL (or re-parsing an uploaded file). caseContext is persisted
+    # here too — it's otherwise never stored anywhere durable, which would silently break
+    # dataset reconstruction from a checkpoint after a restart.
     persist_cb("fetching_sources", {
-        "sources": sources, "sourceTextById": source_text_by_id,
+        "sources": combined_sources, "sourceTextById": combined_source_text_by_id,
         "fetchFailures": fetch_failures, "caseContext": case_context,
     })
-    return run_pipeline_from_sources(sources, source_text_by_id, existing_narrative, case_context, fetch_failures, progress_cb, persist_cb)
+    return run_pipeline_from_sources(combined_sources, combined_source_text_by_id, existing_narrative, case_context, fetch_failures, progress_cb, persist_cb)
 
 
 def run_pipeline_from_sources(sources, source_text_by_id, existing_narrative, case_context, fetch_failures=(), progress_cb=lambda *_: None, persist_cb=lambda *_: None):
@@ -891,8 +1000,17 @@ def run_pipeline_from_sources(sources, source_text_by_id, existing_narrative, ca
     rejected_records_report = []
     fetch_failures = list(fetch_failures)  # the caller's own fetch results — never re-derived here
 
-    non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]]} for s in sources if s["sourceType"] != "competitor"]
-    competitor_sources = [{"id": s["id"], "text": source_text_by_id[s["id"]]} for s in sources if s["sourceType"] == "competitor"]
+    # Defensive/idempotent: the primary injection already happened in run_analysis/jobs.py's
+    # expand-sources dispatch (before fetching_sources was persisted, so the Evidence Room
+    # sees it too) — this is a no-op in that case. See sources_with_pasted_narrative's
+    # docstring for why it's safe and correct to call again here regardless.
+    sources, source_text_by_id = sources_with_pasted_narrative(sources, source_text_by_id, existing_narrative)
+
+    non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] != "competitor"]
+    competitor_sources = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] == "competitor"]
+    has_current_draft_narrative = any(s.get("role") == "current_draft_narrative" for s in non_competitor)
+    company_name = (case_context or {}).get("company", {}).get("name")
+    source_roles_by_id = {s["id"]: s.get("documentRole") for s in sources}
 
     context = {"sources": sources, "source_text_by_id": source_text_by_id, "evidence_pool": {}}
 
@@ -934,21 +1052,22 @@ def run_pipeline_from_sources(sources, source_text_by_id, existing_narrative, ca
     foundation_result, outcome, stage_failure, tb, attempts = run_model_stage(
         "strategic_foundation", FOUNDATION_RESPONSE_SCHEMA,
         lambda pf: pipe.extract_foundation(client, usage, non_competitor, prior_failure=pf),
-        lambda response: process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations),
+        lambda response: process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, has_current_draft_narrative, company_name, source_roles_by_id),
         usage, progress_cb,
     )
     if outcome == "stage_failed":
         persist_cb("strategic_foundation", {"outcome": outcome, "attempts": attempts})
         return _empty_return(outcome, stage_failure, tb, [], [], [], [], None, None, [], evidence_pool)
-    strategic_foundation = foundation_result
-    persist_cb("strategic_foundation", {"outcome": "success", "attempts": attempts, "strategicFoundation": strategic_foundation, "evidencePool": evidence_pool})
+    strategic_foundation, narrative_question = foundation_result
+    persist_cb("strategic_foundation", {"outcome": "success", "attempts": attempts, "strategicFoundation": strategic_foundation, "evidencePool": evidence_pool, "narrativeQuestion": narrative_question})
+    case_context = {**case_context, "narrativeQuestion": narrative_question}
 
     # --- Stage: diagnosis ---
     foundation_summary = [{"id": c["id"], "type": c["type"], "statement": c["statement"], "statementType": c["statementType"]} for c in strategic_foundation]
     diag_result, outcome, stage_failure, tb, attempts = run_model_stage(
         "diagnosis", DIAGNOSIS_RESPONSE_SCHEMA,
         lambda pf: pipe.diagnose(client, usage, non_competitor, foundation_summary, competitor_sources, existing_narrative, evidence_pool, prior_failure=pf),
-        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations),
+        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id),
         usage, progress_cb,
     )
     if outcome == "stage_failed":
@@ -1017,8 +1136,14 @@ def regenerate_from(sources, source_text_by_id, evidence_pool, edited_foundation
     statement_type_violations = []
     rejected_records_report = []
 
-    non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]]} for s in sources if s["sourceType"] != "competitor"]
-    competitor_sources = [{"id": s["id"], "text": source_text_by_id[s["id"]]} for s in sources if s["sourceType"] == "competitor"]
+    # Defensive/idempotent — see sources_with_pasted_narrative's docstring. In practice
+    # sources here already came from a checkpoint that run_analysis injected into, so this
+    # is normally a no-op; kept as a safety net regardless.
+    sources, source_text_by_id = sources_with_pasted_narrative(sources, source_text_by_id, existing_narrative)
+
+    non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] != "competitor"]
+    competitor_sources = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] == "competitor"]
+    source_roles_by_id = {s["id"]: s.get("documentRole") for s in sources}
 
     strategic_foundation = edited_foundation
     foundation_summary = [{"id": c["id"], "type": c["type"], "statement": c["statement"], "statementType": c["statementType"]} for c in strategic_foundation]
@@ -1046,7 +1171,7 @@ def regenerate_from(sources, source_text_by_id, evidence_pool, edited_foundation
     diag_result, outcome, stage_failure, tb, attempts = run_model_stage(
         "diagnosis", DIAGNOSIS_RESPONSE_SCHEMA,
         lambda pf: pipe.diagnose(client, usage, non_competitor, foundation_summary, competitor_sources, existing_narrative, evidence_pool, prior_failure=pf),
-        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations),
+        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id),
         usage, progress_cb,
     )
     if outcome == "stage_failed":
@@ -1104,21 +1229,26 @@ def regenerate_from(sources, source_text_by_id, evidence_pool, edited_foundation
 # human triggers later"). Each rebuilds only the state IT needs from already-validated
 # inputs; none re-fetch a URL or rerun an earlier stage.
 
-def retry_extract_foundation(sources, source_text_by_id, prior_failure=None, progress_cb=lambda *_: None):
+def retry_extract_foundation(sources, source_text_by_id, existing_narrative="", company_name=None, prior_failure=None, progress_cb=lambda *_: None):
     client = pipe.get_client()
     usage = pipe.UsageTracker()
     dropped_links_report, rejected_records_report, statement_type_violations = [], [], []
     evidence_pool = {}  # foundation is the first model stage — nothing to reuse yet
 
-    non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]]} for s in sources if s["sourceType"] != "competitor"]
+    # Defensive/idempotent — see sources_with_pasted_narrative's docstring.
+    sources, source_text_by_id = sources_with_pasted_narrative(sources, source_text_by_id, existing_narrative)
+
+    non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] != "competitor"]
+    has_current_draft_narrative = any(s.get("role") == "current_draft_narrative" for s in non_competitor)
+    source_roles_by_id = {s["id"]: s.get("documentRole") for s in sources}
     progress_cb("strategic_foundation")
     result, outcome, error_info, tb, attempt_usage = _attempt_stage_once(
         "strategic_foundation", FOUNDATION_RESPONSE_SCHEMA,
         lambda pf: pipe.extract_foundation(client, usage, non_competitor, prior_failure=pf),
-        lambda response: process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations),
+        lambda response: process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, has_current_draft_narrative, company_name, source_roles_by_id),
         usage, prior_failure,
     )
-    strategic_foundation = result if outcome == "success" else []
+    strategic_foundation, narrative_question = result if outcome == "success" else ([], None)
     outcome = "stage_failed" if outcome == "failed" else outcome
     diagnostics = {
         "outcome": outcome, "failure_reason": error_info["validation_error"] if error_info else None,
@@ -1127,7 +1257,7 @@ def retry_extract_foundation(sources, source_text_by_id, prior_failure=None, pro
         "attempt_usage": attempt_usage,
     }
     return {
-        "strategicFoundation": strategic_foundation, "evidencePool": evidence_pool,
+        "strategicFoundation": strategic_foundation, "evidencePool": evidence_pool, "narrativeQuestion": narrative_question,
         "outcome": outcome, "diagnostics": diagnostics, "debug_traceback": tb,
     }
 
@@ -1137,15 +1267,19 @@ def retry_diagnose(sources, source_text_by_id, evidence_pool, strategic_foundati
     usage = pipe.UsageTracker()
     dropped_links_report, rejected_records_report, statement_type_violations = [], [], []
 
-    non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]]} for s in sources if s["sourceType"] != "competitor"]
-    competitor_sources = [{"id": s["id"], "text": source_text_by_id[s["id"]]} for s in sources if s["sourceType"] == "competitor"]
+    # Defensive/idempotent — see sources_with_pasted_narrative's docstring.
+    sources, source_text_by_id = sources_with_pasted_narrative(sources, source_text_by_id, existing_narrative)
+
+    non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] != "competitor"]
+    competitor_sources = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] == "competitor"]
     foundation_summary = [{"id": c["id"], "type": c["type"], "statement": c["statement"], "statementType": c["statementType"]} for c in strategic_foundation]
+    source_roles_by_id = {s["id"]: s.get("documentRole") for s in sources}
 
     progress_cb("diagnosis")
     result, outcome, error_info, tb, attempt_usage = _attempt_stage_once(
         "diagnosis", DIAGNOSIS_RESPONSE_SCHEMA,
         lambda pf: pipe.diagnose(client, usage, non_competitor, foundation_summary, competitor_sources, existing_narrative, evidence_pool, prior_failure=pf),
-        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations),
+        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id),
         usage, prior_failure,
     )
     diagnosis, competitor_contrasts = result if outcome == "success" else ([], [])

@@ -17,6 +17,7 @@ during development. Fixed two ways, both required:
 
 Run with: python3 -m unittest test_analyze_endpoints -v
 """
+import io
 import json
 import os
 import shutil
@@ -26,12 +27,14 @@ import time
 import unittest
 from unittest.mock import patch, ANY
 
+import docx
+
 os.environ["ANTHROPIC_API_KEY"] = "sk-test-do-not-use-not-a-real-key"
 
 import job_persistence
 import jobs
 from app import app
-from pipeline_runner import PipelineError, check_manual_retry_allowed
+from pipeline_runner import PASTED_NARRATIVE_SOURCE_ID, PipelineError, check_manual_retry_allowed
 
 _TEST_JOB_STATE_ROOT = None
 _REAL_JOB_STATE_ROOT = job_persistence.JOB_STATE_ROOT
@@ -1114,7 +1117,7 @@ class UsageAccumulation(unittest.TestCase):
         regenerate must leave checkpoint["usage"]["totals"] as the SUM of both, not just
         the regenerate's own smaller total."""
 
-        def fake_run_analysis(company_url, supporting_urls, competitor_urls, existing_narrative, progress_cb=None, persist_cb=None):
+        def fake_run_analysis(company_url, supporting_urls, competitor_urls, existing_narrative, progress_cb=None, persist_cb=None, **kwargs):
             if persist_cb:
                 persist_cb("fetching_sources", {"sources": [], "sourceTextById": {}, "fetchFailures": [], "caseContext": None})
                 persist_cb("strategic_foundation", {"outcome": "success", "strategicFoundation": [{"id": "sf1", "type": "customer", "statement": "x", "statementType": "source_fact", "evidence": []}], "evidencePool": {}, "attempts": []})
@@ -1438,6 +1441,111 @@ class ExpandSourcesEndpoint(unittest.TestCase):
         self.assertEqual(post_checkpoint["strategic_foundation"]["outcome"], "invalidated")
 
 
+class ExpandSourcesPreservesRoleAwareSources(unittest.TestCase):
+    """/expand-sources re-fetches from scratch (jobs.py's "expand_sources" dispatch calls
+    fetch_all_sources fresh) — which does NOT know about uploaded documents or pasted
+    narrative text at all, since neither is a URL. Without re-merging both back in after
+    the fresh fetch, "Add sources" would silently drop a job's uploaded internal document
+    and its pasted-narrative role-awareness the moment a user tried to strengthen an
+    analysis with more public sources — the opposite of what that feature is for."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        self.addCleanup(patch.stopall)
+        patch("anthropic_pipeline.get_client", return_value=object()).start()
+        self.addCleanup(jobs._QUEUE.join)
+
+    def _seed_job_with_upload_and_pasted_narrative(self):
+        sources = [{"id": "src1", "companyId": "live", "title": "Co", "publisher": "co.com",
+                     "sourceType": "website", "url": "https://co.com", "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved"}]
+        return _seed_checkpoint_job(
+            meta={"kind": "analyze", "status": "done", "stage": "done", "error": None, "createdAt": "2026-01-01T00:00:00Z"},
+            jobInput={"companyUrl": "https://co.com", "supportingUrls": [], "competitorUrls": [], "existingNarrative": "We are the leader in X."},
+            uploadedDocuments={"documents": [{
+                "id": "src_upload_draft", "title": "Draft.docx", "documentRole": "current_draft_narrative",
+                "flatText": "Uploaded draft text.", "structureBlocks": [], "wordCount": 3, "truncated": False,
+                "retrievedAt": "2026-01-01T00:00:00Z",
+            }]},
+            fetching_sources={"sources": sources, "sourceTextById": {"src1": "text"}, "caseContext": {"id": "live"}},
+            strategic_foundation={
+                "outcome": "success",
+                "strategicFoundation": [{"id": "sf1", "type": "customer", "statement": "x", "statementType": "source_fact", "evidence": []}],
+                "evidencePool": {}, "attempts": [],
+            },
+        )
+
+    def test_expand_sources_re_merges_the_uploaded_document_and_pasted_narrative(self):
+        job_id = self._seed_job_with_upload_and_pasted_narrative()
+        patch("jobs.fetch_all_sources", return_value=(
+            [{"id": "src1", "companyId": "live", "title": "Co", "publisher": "co.com", "sourceType": "website",
+              "url": "https://co.com", "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved"},
+             {"id": "src2", "companyId": "live", "title": "Rival", "publisher": "rival.example.com", "sourceType": "competitor",
+              "url": "https://example.com/rival", "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved"}],
+            {"src1": "text", "src2": "rival text"}, [],
+            {"id": "src1", "title": "Co", "publisher": "co.com"},
+        )).start()
+        patch("jobs.run_pipeline_from_sources", return_value=FAKE_SUCCESS_RESULT).start()
+
+        resp = self.client.post(f"/api/analyze-company/{job_id}/expand-sources", json={
+            "companyUrl": "https://co.com", "competitorUrls": ["https://example.com/rival"],
+        })
+        self.assertEqual(resp.status_code, 202)
+        _poll_until_terminal(self.client, job_id)
+
+        checkpoint = job_persistence.load_job_state(job_id)
+        merged_ids = {s["id"] for s in checkpoint["fetching_sources"]["sources"]}
+        self.assertIn("src_upload_draft", merged_ids, "uploaded document was dropped by expand-sources")
+        self.assertIn(PASTED_NARRATIVE_SOURCE_ID, merged_ids, "pasted-narrative source was dropped by expand-sources")
+        merged_by_id = {s["id"]: s for s in checkpoint["fetching_sources"]["sources"]}
+        self.assertEqual(merged_by_id["src_upload_draft"]["documentRole"], "current_draft_narrative")
+        self.assertEqual(merged_by_id[PASTED_NARRATIVE_SOURCE_ID]["documentRole"], "current_draft_narrative")
+        self.assertEqual(checkpoint["fetching_sources"]["sourceTextById"][PASTED_NARRATIVE_SOURCE_ID], "We are the leader in X.")
+
+
+class NarrativeQuestionSafetyNet(unittest.TestCase):
+    """jobs._case_context_with_narrative_question — the SECOND, independent layer (layer
+    1 is pipeline_runner.resolve_narrative_question, which runs before anything is ever
+    persisted). This layer exists specifically for checkpoints that predate this feature,
+    or any other case where narrativeQuestion never made it into the strategic_foundation
+    section — /status must still never return "undefined"/null/empty for caseContext."""
+
+    def setUp(self):
+        self.addCleanup(patch.stopall)
+        patch("anthropic_pipeline.get_client", return_value=object()).start()
+
+    _DONE_META = {"kind": "analyze", "status": "done", "stage": "done", "error": None, "createdAt": "2026-01-01T00:00:00Z"}
+
+    def test_old_checkpoint_with_no_narrative_question_at_all_still_gets_a_valid_one(self):
+        job_id = _seed_checkpoint_job(
+            meta=self._DONE_META,
+            fetching_sources={"sources": [], "sourceTextById": {}, "caseContext": {"id": "live", "company": {"name": "Acme"}}},
+            strategic_foundation={"outcome": "success", "strategicFoundation": [], "evidencePool": {}, "attempts": []},
+        )
+        job = jobs.get_job(job_id)
+        question = job["dataset"]["caseContext"]["narrativeQuestion"]
+        self.assertIsInstance(question, str)
+        self.assertTrue(question.strip())
+        self.assertNotIn("undefined", question.lower())
+        self.assertIn("Acme", question)
+
+    def test_persisted_narrative_question_passes_through_unmodified(self):
+        job_id = _seed_checkpoint_job(
+            meta=self._DONE_META,
+            fetching_sources={"sources": [], "sourceTextById": {}, "caseContext": {"id": "live", "company": {"name": "Acme"}}},
+            strategic_foundation={
+                "outcome": "success", "strategicFoundation": [], "evidencePool": {}, "attempts": [],
+                "narrativeQuestion": "Is Acme's transformer identity connected to its broader ambitions?",
+            },
+        )
+        job = jobs.get_job(job_id)
+        self.assertEqual(job["dataset"]["caseContext"]["narrativeQuestion"], "Is Acme's transformer identity connected to its broader ambitions?")
+
+    def test_no_case_context_yet_returns_none_not_a_crash(self):
+        job_id = _seed_checkpoint_job(meta=self._DONE_META, fetching_sources={"sources": []})
+        job = jobs.get_job(job_id)
+        self.assertIsNone(job["dataset"]["caseContext"])
+
+
 class RegenerationCap(unittest.TestCase):
     """MAX_FULL_REGENERATIONS (2) full regenerations are allowed per job. Persisted
     server-side (checkpoint["regenerationCount"]), checked and incremented atomically, a
@@ -1678,6 +1786,274 @@ class TracebackHardening(unittest.TestCase):
 
         self.assertIn(job_id, removed)
         self.assertIsNone(job_persistence.load_job_state(job_id))
+
+
+def _docx_bytes(build_fn=None):
+    d = docx.Document()
+    if build_fn:
+        build_fn(d)
+    else:
+        d.add_paragraph("Placeholder internal document text.")
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()
+
+
+def _multipart_payload(meta, files):
+    """files: list of (field_name, filename, raw_bytes). Werkzeug's test client infers
+    multipart/form-data automatically whenever any `data` value is a file-like tuple."""
+    payload = {"meta": json.dumps(meta)}
+    for field_name, filename, raw_bytes in files:
+        payload[field_name] = (io.BytesIO(raw_bytes), filename)
+    return payload
+
+
+def _fake_run_merging_uploads(fake_result, extra_evidence_pool=None):
+    """Like _fake_run_with_sections, but actually incorporates uploaded_sources/
+    uploaded_source_text_by_id into what gets persisted to fetching_sources — mirroring
+    run_analysis()'s own real merge behavior — since _fake_run_with_sections predates
+    uploads and ignores those kwargs entirely (it only ever persists fake_result's own
+    static, upload-less source list)."""
+    def side_effect(*args, progress_cb=None, persist_cb=None, uploaded_sources=(), uploaded_source_text_by_id=None, **kwargs):
+        ds = fake_result["dataset"]
+        combined_sources = list(ds.get("sources", [])) + list(uploaded_sources)
+        combined_text = dict(uploaded_source_text_by_id or {})
+        if persist_cb is not None and ds is not None:
+            persist_cb("fetching_sources", {"sources": combined_sources, "sourceTextById": combined_text, "fetchFailures": [], "caseContext": ds.get("caseContext")})
+            persist_cb("strategic_foundation", {"outcome": "success", "strategicFoundation": ds.get("strategicFoundation", []), "evidencePool": extra_evidence_pool or {}})
+            persist_cb("diagnosis", {"outcome": "success", "diagnosis": ds.get("diagnosis", []), "competitorContrasts": ds.get("competitorContrasts", []), "evidencePool": extra_evidence_pool or {}})
+            persist_cb("narrative_choices", {"outcome": "success", "candidates": ds.get("candidates", [])})
+            persist_cb("critique", {"outcome": "success", "candidates": ds.get("candidates", [])})
+            persist_cb("recommendation_and_map", {"outcome": "success", "recommendation": ds.get("recommendation"), "narrativeMap": ds.get("narrativeMap"), "audiences": ds.get("audiences", [])})
+        return fake_result
+    return side_effect
+
+
+class InternalDocumentUpload(unittest.TestCase):
+    """POST /api/analyze-company as multipart/form-data with internalDocument_N file
+    parts + a "meta" JSON field carrying internalDocumentRoles (index-matched). Every
+    validation/extraction check runs synchronously before any job is created — a rejected
+    upload creates no job at all. Zero network, zero Anthropic API calls: jobs.run_analysis
+    is always mocked before any job is allowed to actually run."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        self.addCleanup(patch.stopall)
+        patch("anthropic_pipeline.get_client", return_value=object()).start()
+        self.addCleanup(jobs._QUEUE.join)
+
+    def test_valid_docx_is_accepted_and_creates_a_job(self):
+        patch("jobs.run_analysis", side_effect=_fake_run_with_sections(FAKE_SUCCESS_RESULT)).start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["current_draft_narrative"]},
+            [("internalDocument_0", "Draft.docx", _docx_bytes())],
+        ))
+        self.assertEqual(resp.status_code, 202)
+        job_id = resp.get_json()["jobId"]
+        _poll_until_terminal(self.client, job_id)
+
+    def test_uploaded_source_has_internal_type_and_the_chosen_role(self):
+        patch("jobs.run_analysis", side_effect=_fake_run_with_sections(FAKE_SUCCESS_RESULT)).start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["investor_or_financial_material"]},
+            [("internalDocument_0", "Q3_Investor_Deck.docx", _docx_bytes())],
+        ))
+        job_id = resp.get_json()["jobId"]
+        checkpoint = job_persistence.load_job_state(job_id)
+        docs = checkpoint["uploadedDocuments"]["documents"]
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0]["documentRole"], "investor_or_financial_material")
+        self.assertEqual(docs[0]["title"], "Q3_Investor_Deck.docx")
+        self.assertTrue(docs[0]["id"].startswith("src_upload_"))
+
+    def test_more_than_five_documents_is_rejected(self):
+        mock_run = patch("jobs.run_analysis").start()
+        files = [(f"internalDocument_{i}", f"doc{i}.docx", _docx_bytes()) for i in range(6)]
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["other_internal_context"] * 6},
+            files,
+        ))
+        self.assertEqual(resp.status_code, 400)
+        mock_run.assert_not_called()
+
+    def test_missing_role_for_an_uploaded_file_is_rejected(self):
+        mock_run = patch("jobs.run_analysis").start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": []},
+            [("internalDocument_0", "Draft.docx", _docx_bytes())],
+        ))
+        self.assertEqual(resp.status_code, 400)
+        mock_run.assert_not_called()
+
+    def test_unknown_role_is_rejected(self):
+        mock_run = patch("jobs.run_analysis").start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["ceo_vibes"]},
+            [("internalDocument_0", "Draft.docx", _docx_bytes())],
+        ))
+        self.assertEqual(resp.status_code, 400)
+        mock_run.assert_not_called()
+
+    def test_wrong_extension_is_rejected_with_a_clear_message_and_no_job(self):
+        mock_run = patch("jobs.run_analysis").start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["other_internal_context"]},
+            [("internalDocument_0", "notes.pdf", b"%PDF-1.4 fake pdf bytes")],
+        ))
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("only .docx files", resp.get_json()["error"])
+        mock_run.assert_not_called()
+
+    def test_empty_docx_is_rejected(self):
+        mock_run = patch("jobs.run_analysis").start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["other_internal_context"]},
+            [("internalDocument_0", "blank.docx", _docx_bytes(lambda d: None))],
+        ))
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("no extractable text", resp.get_json()["error"])
+        mock_run.assert_not_called()
+
+    def test_corrupted_docx_is_rejected(self):
+        mock_run = patch("jobs.run_analysis").start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["other_internal_context"]},
+            [("internalDocument_0", "corrupt.docx", b"not a real docx")],
+        ))
+        self.assertEqual(resp.status_code, 400)
+        mock_run.assert_not_called()
+
+    def test_password_protected_docx_is_rejected_with_specific_message(self):
+        mock_run = patch("jobs.run_analysis").start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["other_internal_context"]},
+            [("internalDocument_0", "secret.docx", b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1" + b"0" * 100)],
+        ))
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("password-protected", resp.get_json()["error"])
+        mock_run.assert_not_called()
+
+    def test_no_files_at_all_still_works_exactly_like_the_plain_json_path(self):
+        """A multipart request with zero internal documents (e.g. the form always submits
+        multipart once JS supports it) must behave identically to today's JSON-only path
+        — no uploadedDocuments section at all, not an empty one."""
+        patch("jobs.run_analysis", side_effect=_fake_run_with_sections(FAKE_SUCCESS_RESULT)).start()
+        resp = self.client.post(
+            "/api/analyze-company",
+            data=_multipart_payload({"companyUrl": "https://example.com", "internalDocumentRoles": []}, []),
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(resp.status_code, 202)
+        job_id = resp.get_json()["jobId"]
+        checkpoint = job_persistence.load_job_state(job_id)
+        self.assertNotIn("uploadedDocuments", checkpoint)
+
+    def test_json_only_request_is_completely_unaffected(self):
+        """The existing no-files JSON path — confirms the multipart branch is additive,
+        never engaged for a plain application/json request."""
+        patch("jobs.run_analysis", side_effect=_fake_run_with_sections(FAKE_SUCCESS_RESULT)).start()
+        resp = self.client.post("/api/analyze-company", json={"companyUrl": "https://example.com"})
+        self.assertEqual(resp.status_code, 202)
+
+    def test_raw_file_bytes_and_extracted_text_never_appear_in_status_response(self):
+        """The core privacy guarantee: /status must return source METADATA (including
+        documentRole) but never sourceTextById or raw file bytes for an uploaded
+        document."""
+        secret_sentence = "The confidential 2027 revenue target is $500M internally."
+        patch("jobs.run_analysis", side_effect=_fake_run_merging_uploads(FAKE_SUCCESS_RESULT)).start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["current_draft_narrative"]},
+            [("internalDocument_0", "Draft.docx", _docx_bytes(lambda d: d.add_paragraph(secret_sentence)))],
+        ))
+        job_id = resp.get_json()["jobId"]
+        final = _poll_until_terminal(self.client, job_id)
+
+        raw_response_text = json.dumps(final)
+        self.assertNotIn(secret_sentence, raw_response_text)
+        self.assertNotIn("flatText", raw_response_text)
+        self.assertNotIn("structureBlocks", raw_response_text)
+        # Metadata IS present and correct — this isn't just "the field is missing by luck."
+        internal_source = next(s for s in final["dataset"]["sources"] if s["sourceType"] == "internal")
+        self.assertEqual(internal_source["documentRole"], "current_draft_narrative")
+        self.assertEqual(internal_source["title"], "Draft.docx")
+
+    def test_uploaded_file_is_written_under_this_jobs_own_uploads_directory(self):
+        patch("jobs.run_analysis", side_effect=_fake_run_with_sections(FAKE_SUCCESS_RESULT)).start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["current_draft_narrative"]},
+            [("internalDocument_0", "Draft.docx", _docx_bytes())],
+        ))
+        job_id = resp.get_json()["jobId"]
+        _poll_until_terminal(self.client, job_id)
+        upload_dir = job_persistence.upload_dir(job_id)
+        self.assertTrue(os.path.isdir(upload_dir))
+        saved_files = os.listdir(upload_dir)
+        self.assertEqual(len(saved_files), 1)
+        self.assertTrue(saved_files[0].endswith(".docx"))
+
+    def test_deleting_the_job_removes_the_uploaded_file_too(self):
+        patch("jobs.run_analysis", side_effect=_fake_run_with_sections(FAKE_SUCCESS_RESULT)).start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["current_draft_narrative"]},
+            [("internalDocument_0", "Draft.docx", _docx_bytes())],
+        ))
+        job_id = resp.get_json()["jobId"]
+        _poll_until_terminal(self.client, job_id)
+        upload_dir = job_persistence.upload_dir(job_id)
+        self.assertTrue(os.path.isdir(upload_dir))
+
+        job_persistence.delete_job_state(job_id)
+
+        self.assertFalse(os.path.exists(upload_dir))
+        self.assertIsNone(job_persistence.load_job_state(job_id))
+
+    def test_excerpt_from_an_uploaded_document_gets_a_scope_location_in_status(self):
+        """End-to-end through the real read-time enrichment in jobs._dataset_from_checkpoint
+        — not just the unit-level document_extractor.locate_excerpt_scope test."""
+        excerpt_text = "Revenue grew twenty percent year over year."
+
+        def build(d):
+            d.add_heading("Financial Performance", level=1)
+            d.add_paragraph(excerpt_text)
+
+        result_with_evidence = {
+            "dataset": {
+                "caseContext": {"id": "live", "selectorLabel": "x", "selectorDescription": "x", "company": {"name": "Acme", "oneLiner": ""}},
+                "sources": [], "evidence": [], "strategicFoundation": [], "diagnosis": [], "candidates": [],
+                "recommendation": None, "narrativeMap": None, "audiences": [], "competitorContrasts": [],
+            },
+            "diagnostics": {"critical_failure": None, "api_calls": [], "token_totals": {"input_tokens": 0, "output_tokens": 0}},
+        }
+
+        def fake_run(company_url, supporting_urls, competitor_urls, existing_narrative, progress_cb=None, persist_cb=None, uploaded_sources=(), uploaded_source_text_by_id=None, **kwargs):
+            source_id = uploaded_sources[0]["id"]
+            persist_cb("fetching_sources", {
+                "sources": list(uploaded_sources), "sourceTextById": dict(uploaded_source_text_by_id or {}),
+                "fetchFailures": [], "caseContext": result_with_evidence["dataset"]["caseContext"],
+            })
+            persist_cb("strategic_foundation", {
+                "outcome": "success",
+                "strategicFoundation": [{"id": "sf1", "type": "proof", "statement": "Revenue grew.", "statementType": "source_fact",
+                                          "evidence": [{"evidenceId": "ev1", "relevance": "direct", "rationale": "x"}]}],
+                "evidencePool": {"ev1": {"id": "ev1", "sourceId": source_id, "excerpt": excerpt_text, "paraphrase": "Revenue grew.",
+                                          "evidenceType": "financial", "strength": "strong", "freshness": "current",
+                                          "confidence": 0.9, "verified": True, "supportsIds": ["sf1"]}},
+                "attempts": [],
+            })
+            return result_with_evidence
+
+        patch("jobs.run_analysis", side_effect=fake_run).start()
+        resp = self.client.post("/api/analyze-company", data=_multipart_payload(
+            {"companyUrl": "https://example.com", "internalDocumentRoles": ["current_draft_narrative"]},
+            [("internalDocument_0", "Draft.docx", _docx_bytes(build))],
+        ))
+        job_id = resp.get_json()["jobId"]
+        final = _poll_until_terminal(self.client, job_id)
+
+        evidence_item = final["dataset"]["evidence"][0]
+        self.assertEqual(evidence_item["excerpt"], excerpt_text)
+        self.assertIn("Financial Performance", evidence_item["scope"])
+        self.assertIn("paragraph", evidence_item["scope"])
 
 
 class CorsHeaders(unittest.TestCase):

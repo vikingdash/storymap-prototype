@@ -119,6 +119,30 @@ def _checkpoint_path(job_id):
     return os.path.join(_job_dir(job_id), CHECKPOINT_FILENAME)
 
 
+def upload_dir(job_id):
+    """Where a job's uploaded internal-document files live — a subdirectory of the job's
+    own directory, so it inherits the exact same guarantees for free: covered by the
+    same backend/job_state/ gitignore rule (never committed), and removed by the exact
+    same delete_job_state()/cleanup_expired_jobs() shutil.rmtree() of the whole job
+    directory (no separate deletion path to keep in sync)."""
+    return os.path.join(_job_dir(job_id), "uploads")
+
+
+def save_uploaded_file(job_id, source_id, raw_bytes):
+    """Writes the ORIGINAL uploaded file's bytes to this job's uploads/ subdirectory —
+    purely an audit artifact; the pipeline itself only ever reads the already-extracted
+    text/structure persisted in the checkpoint (see document_extractor.py), never
+    re-opens this file. Requires the job's directory to already exist (i.e. call after
+    create_analyze_job, which creates it via save_job_state)."""
+    directory = upload_dir(job_id)
+    os.makedirs(directory, exist_ok=True)
+    safe_id = _safe_job_id(source_id)  # same alnum/-/_ sanitizer already used for job_id — a source_id is equally caller-influenced (derived from a filename)
+    path = os.path.join(directory, f"{safe_id}.docx")
+    with open(path, "wb") as f:
+        f.write(raw_bytes)
+    return path
+
+
 def save_job_state(job_id, state):
     """Atomic write: temp file created in the SAME directory as the real target (so
     os.replace is guaranteed to be an atomic rename on the same filesystem, not a

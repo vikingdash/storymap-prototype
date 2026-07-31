@@ -2,14 +2,23 @@
 
 Exposes the background-job API the frontend polls for stage-by-stage progress
 (jobs.py), plus the dev-only /api/fetch-test endpoint kept from the fetch/extract-layer
-validation step. Binds to 127.0.0.1 only — this process is never exposed on the network
-and is not deployed publicly; the public GitHub Pages build has no backend at all and
-degrades gracefully in the frontend when this server isn't reachable.
+validation step. Binds to 127.0.0.1 by default — this process is not deployed publicly;
+the public GitHub Pages build has no backend at all and degrades gracefully in the
+frontend when this server isn't reachable.
+
+For temporary same-Wi-Fi testing from a second device, set STORYMAP_HOST=0.0.0.0 (still
+never deployed publicly — this only reaches devices on the same local network/router,
+same as any other LAN service) and pass that device's frontend origin in
+STORYMAP_ALLOWED_ORIGINS (e.g. "http://10.0.0.104:4173") so CORS stays scoped to exactly
+that origin rather than opening up to any origin. The Anthropic API key never leaves this
+process either way — it's read once into the Anthropic SDK client (anthropic_pipeline.py)
+and never appears in any response body.
 
 Run with: python3 app.py (from inside backend/, with backend/.env holding
 ANTHROPIC_API_KEY — see README). The frontend (served separately by ../serve.py) calls
 this over CORS since the two run on different local ports.
 """
+import json
 import os
 
 from dotenv import load_dotenv
@@ -18,6 +27,8 @@ load_dotenv()
 
 from flask import Flask, jsonify, request
 
+import document_extractor
+import job_persistence
 import jobs
 from extractor import extract_readable_text
 from fetcher import FetchError, fetch_url
@@ -27,7 +38,9 @@ from pipeline_runner import (
     RegenerationLimitReachedError,
     RetryLimitReachedError,
     SourceExpansionLimitReachedError,
+    now_iso,
 )
+from schema_constants import DOCUMENT_ROLES
 from ssrf_guard import UnsafeUrlError, assert_safe_url
 
 # Maps the public retry endpoint's <stage> path segment to jobs.py's internal retry job
@@ -46,6 +59,11 @@ app = Flask(__name__)
 
 MAX_URL_LENGTH = 2048
 MAX_NARRATIVE_LENGTH = 20000
+MAX_INTERNAL_DOCUMENTS = 5
+# Hard ceiling on the whole multipart request body — bounds worst-case memory use before
+# any per-file logic even runs, regardless of MAX_INTERNAL_DOCUMENTS or
+# document_extractor.MAX_FILE_BYTES. 5 files x 20MB + generous multipart/JSON overhead.
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
 ALLOWED_ORIGINS = {
     o.strip()
@@ -73,6 +91,17 @@ def cors_preflight(_unused):
     return ("", 204)
 
 
+@app.errorhandler(413)
+def request_too_large(_exc):
+    """Werkzeug enforces app.config["MAX_CONTENT_LENGTH"] before any view function runs —
+    without this handler that would surface as Werkzeug's default HTML error page instead
+    of the same JSON error shape every other rejection in this API uses. Still passes
+    through add_cors_headers (a registered Flask error handler's response goes through
+    the normal after_request pipeline), so a rejected oversized upload doesn't also look
+    like a CORS failure to the frontend."""
+    return jsonify({"error": "Upload exceeds the total request size limit."}), 413
+
+
 def _clean_url_list(value, max_count, field_name):
     if value is None:
         return [], None
@@ -93,9 +122,81 @@ def _clean_url_list(value, max_count, field_name):
     return cleaned, None
 
 
+def _uploaded_files_from_request():
+    """Internal-document files arrive as indexed multipart parts (internalDocument_0,
+    internalDocument_1, ...) rather than repeated same-name parts, so file order is never
+    ambiguous — sorted numerically here, matching the order the paired
+    internalDocumentRoles list (in the "meta" JSON field) was built in on the frontend."""
+    indexed = []
+    for key in request.files:
+        if key.startswith("internalDocument_"):
+            try:
+                idx = int(key[len("internalDocument_"):])
+            except ValueError:
+                continue
+            indexed.append((idx, request.files[key]))
+    return [f for _, f in sorted(indexed, key=lambda pair: pair[0])]
+
+
+def _process_uploaded_documents(payload):
+    """Validates + extracts every uploaded internal document SYNCHRONOUSLY, before any
+    job is created — same convention as URL validation just above. Returns
+    (uploaded_documents, error_response_or_None). Never reads document content into a log
+    line or error message; document_extractor's exceptions already guarantee that (see
+    its module docstring)."""
+    upload_files = _uploaded_files_from_request()
+    document_roles = payload.get("internalDocumentRoles") or []
+
+    if len(upload_files) > MAX_INTERNAL_DOCUMENTS:
+        return None, (jsonify({"error": f"At most {MAX_INTERNAL_DOCUMENTS} internal documents are allowed."}), 400)
+    if len(document_roles) != len(upload_files):
+        return None, (jsonify({"error": "Each uploaded internal document requires exactly one documentRole."}), 400)
+
+    uploaded_documents = []
+    used_ids = set()
+    for file_storage, role in zip(upload_files, document_roles):
+        filename = file_storage.filename or "document.docx"
+        if role not in DOCUMENT_ROLES:
+            return None, (jsonify({"error": f'"{filename}": unknown documentRole "{role}". Must be one of {DOCUMENT_ROLES}.'}), 400)
+        raw_bytes = file_storage.read()
+        try:
+            extracted = document_extractor.validate_and_extract(filename, raw_bytes)
+        except document_extractor.DocumentUploadError as exc:
+            return None, (jsonify({"error": str(exc)}), 400)
+
+        base_id = document_extractor.slugify_filename(filename)
+        source_id = f"src_upload_{base_id}"
+        n = 2
+        while source_id in used_ids:
+            source_id = f"src_upload_{base_id}_{n}"
+            n += 1
+        used_ids.add(source_id)
+
+        uploaded_documents.append({
+            "id": source_id,
+            "title": filename,
+            "documentRole": role,
+            "flatText": extracted["flatText"],
+            "structureBlocks": extracted["structureBlocks"],
+            "wordCount": extracted["wordCount"],
+            "truncated": extracted["truncated"],
+            "retrievedAt": now_iso(),
+            "_rawBytes": raw_bytes,  # stripped before this dict is ever persisted to a checkpoint — see analyze_company()
+        })
+    return uploaded_documents, None
+
+
 @app.post("/api/analyze-company")
 def analyze_company():
-    payload = request.get_json(silent=True) or {}
+    is_multipart = (request.content_type or "").startswith("multipart/form-data")
+    if is_multipart:
+        try:
+            payload = json.loads(request.form.get("meta") or "{}")
+        except json.JSONDecodeError:
+            return jsonify({"error": '"meta" field must be valid JSON'}), 400
+    else:
+        payload = request.get_json(silent=True) or {}
+
     company_url = (payload.get("companyUrl") or "").strip()
     existing_narrative = (payload.get("existingNarrative") or "").strip()
 
@@ -123,7 +224,25 @@ def analyze_company():
         except UnsafeUrlError as exc:
             return jsonify({"error": f"{url}: {exc}"}), 400
 
-    job_id = jobs.create_analyze_job(company_url, supporting_urls, competitor_urls, existing_narrative)
+    uploaded_documents = []
+    if is_multipart:
+        uploaded_documents, error_response = _process_uploaded_documents(payload)
+        if error_response is not None:
+            return error_response
+
+    # Strip raw bytes out of what gets persisted to the checkpoint (JSON-only, no file
+    # content) — kept only in this local list, written straight to disk right after the
+    # job (and its directory) exist, never round-tripped through job_persistence's
+    # checkpoint mechanism at all.
+    raw_bytes_by_id = {doc["id"]: doc.pop("_rawBytes") for doc in uploaded_documents}
+
+    job_id = jobs.create_analyze_job(
+        company_url, supporting_urls, competitor_urls, existing_narrative,
+        uploaded_documents=uploaded_documents or None,
+    )
+    for source_id, raw_bytes in raw_bytes_by_id.items():
+        job_persistence.save_uploaded_file(job_id, source_id, raw_bytes)
+
     return jsonify({"jobId": job_id}), 202
 
 
@@ -341,4 +460,9 @@ jobs.start_worker()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5055))
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    # Defaults to loopback-only, matching this module's own docstring. Only ever becomes
+    # 0.0.0.0 (reachable from other devices on the same local network) when an operator
+    # explicitly opts in via STORYMAP_HOST for a temporary same-Wi-Fi test — never a
+    # public deployment, and never the default.
+    host = os.environ.get("STORYMAP_HOST", "127.0.0.1")
+    app.run(host=host, port=port, debug=False, threaded=True)

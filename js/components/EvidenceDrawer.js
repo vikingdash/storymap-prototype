@@ -55,6 +55,7 @@ export function mountEvidenceDrawer(root, getService) {
     return `
       <div class="evidence-card">
         <span class="${relevance.className} relevance-badge">Support for this statement: ${relevance.label}</span>
+        ${link.relevance === "company_position" ? `<p class="muted small">The company makes this claim. Independent evidence is still needed to confirm it.</p>` : ""}
         <blockquote>&ldquo;${escapeHtml(evidence.excerpt)}&rdquo;</blockquote>
         <p class="muted"><strong>StoryMap interpretation:</strong> ${escapeHtml(evidence.paraphrase)}</p>
         <p class="rationale-line"><strong>How this supports the statement:</strong> ${escapeHtml(link.rationale)}</p>

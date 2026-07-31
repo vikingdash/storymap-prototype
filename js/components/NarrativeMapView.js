@@ -4,7 +4,7 @@
 // (not a repeated, unlabeled source-publisher chip standing in for several different things the
 // map asserts) — each shows its evidence strength, support classification and source count, and
 // is individually click-through to the evidence drawer. The screen ends with a real decision
-// action, "Approve as provisional narrative," not just a "continue" link.
+// action, "Save as working narrative," not just a "continue" link.
 import { escapeHtml, relevanceLabel, strengthLabel, statementTypeBadge } from "../labels.js";
 import { setNarrativeApproved } from "../state.js";
 
@@ -53,7 +53,7 @@ export async function renderNarrativeMapView(container, { service, state, drawer
       <p class="lead">This is the structured output that messaging, executive communications and future monitoring would use once leadership approves it.</p>
       <div class="map-meta">
         <span class="chip">Version ${map.version}</span>
-        <span class="chip chip-status-${approved ? "approved" : map.status}" data-role="status-chip">${approved ? "Approved (provisional)" : escapeHtml(capitalize(map.status))}</span>
+        <span class="chip chip-status-${approved ? "approved" : map.status}" data-role="status-chip">${approved ? "Working narrative" : escapeHtml(capitalize(map.status))}</span>
       </div>
     </section>
 
@@ -95,10 +95,10 @@ export async function renderNarrativeMapView(container, { service, state, drawer
     </div>
 
     <div class="card approve-card">
-      <h3>Approve as provisional narrative</h3>
-      <p class="muted small">This creates Narrative Map Version 1. It does not publish or activate external messaging.</p>
+      <h3>Save as working narrative</h3>
+      <p class="muted small">This marks the current direction as the version you want to keep reviewing and refining. Nothing is published externally.</p>
       <button class="primary-button" type="button" data-action="approve" ${approved ? "disabled" : ""}>
-        ${approved ? "Approved as provisional narrative ✓" : "Approve as provisional narrative"}
+        ${approved ? "Saved as working narrative ✓" : "Save as working narrative"}
       </button>
     </div>
 
@@ -153,9 +153,9 @@ export async function renderNarrativeMapView(container, { service, state, drawer
   approveBtn.addEventListener("click", () => {
     setNarrativeApproved(true);
     approveBtn.disabled = true;
-    approveBtn.textContent = "Approved as provisional narrative ✓";
+    approveBtn.textContent = "Saved as working narrative ✓";
     const statusChip = container.querySelector('[data-role="status-chip"]');
-    statusChip.textContent = "Approved (provisional)";
+    statusChip.textContent = "Working narrative";
     statusChip.className = "chip chip-status-approved";
   });
 }
@@ -175,6 +175,7 @@ function renderCoreClaim(claim, evidenceIndex, drawer) {
       ${strengths.map((s) => { const l = strengthLabel(s); return `<span class="${l.className}">${l.label}</span>`; }).join("")}
       <span class="chip">${sourceCount} source${sourceCount === 1 ? "" : "s"}</span>
     </div>
+    ${relevances.includes("company_position") ? `<p class="muted small">The company makes this claim. Independent evidence is still needed to confirm it.</p>` : ""}
     <button type="button" class="text-link" data-action="view-evidence">View evidence</button>
   `;
   el.querySelector('[data-action="view-evidence"]').addEventListener("click", () => drawer.openEvidenceLinks(claim.evidence, claim.statement));

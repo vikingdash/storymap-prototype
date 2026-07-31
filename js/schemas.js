@@ -50,8 +50,12 @@
  * being real and evidence being *relevant to this exact claim* are different questions — an
  * EvidenceLink answers the second one. "direct"/"partial" evidence is allowed to raise a
  * statement's confidence; "context"/"conflicting" evidence is not (see recalculateConfidence in
- * case-utils.js).
- * @typedef {"direct"|"partial"|"context"|"conflicting"} EvidenceRelevance
+ * case-utils.js). "company_position" is a fifth value, live-flow-only: the backend
+ * (pipeline_runner.sanitize_links) deterministically downgrades a "direct" link to this when its
+ * evidence came from a source with documentRole "current_draft_narrative" — the draft directly
+ * states the claim, but that is not independent proof it's true, so (like "context"/"conflicting")
+ * it must never raise confidence either. Never produced by Wix/HPS's static seed data.
+ * @typedef {"direct"|"partial"|"context"|"conflicting"|"company_position"} EvidenceRelevance
  */
 
 /**
@@ -340,4 +344,5 @@ export const EVIDENCE_RELEVANCE_LABELS = {
   partial: "Partial",
   context: "Context only",
   conflicting: "Conflicting",
+  company_position: "Company's stated position",
 };

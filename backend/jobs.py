@@ -28,6 +28,7 @@ import time
 import traceback
 import uuid
 
+import document_extractor
 import job_persistence
 from pipeline_runner import (
     PipelineError,
@@ -47,6 +48,7 @@ from pipeline_runner import (
     invalidate_downstream_stages,
     now_iso,
     regenerate_from,
+    resolve_narrative_question,
     retry_critique_candidates,
     retry_diagnose,
     retry_extract_foundation,
@@ -54,6 +56,7 @@ from pipeline_runner import (
     retry_recommendation_and_map,
     run_analysis,
     run_pipeline_from_sources,
+    sources_with_pasted_narrative,
     validate_edited_foundation,
 )
 
@@ -223,13 +226,22 @@ def _create_job_record(kind):
     return job_id
 
 
-def create_analyze_job(company_url, supporting_urls, competitor_urls, existing_narrative):
+def create_analyze_job(company_url, supporting_urls, competitor_urls, existing_narrative, uploaded_documents=None):
+    """uploaded_documents: already-validated, already-extracted internal .docx documents
+    (app.py calls document_extractor.validate_and_extract() synchronously, before this
+    function is ever reached, so a bad file never gets this far) — each a dict with
+    id/title/documentRole/flatText/structureBlocks/wordCount/truncated/retrievedAt. Raw
+    file bytes are NEVER part of this payload (app.py writes those separately, straight
+    to disk via job_persistence.save_uploaded_file, after this function returns the
+    job_id) — this checkpoint section holds only JSON-safe extracted text/metadata."""
     job_id = _create_job_record("analyze")
     payload = {
         "companyUrl": company_url, "supportingUrls": supporting_urls,
         "competitorUrls": competitor_urls, "existingNarrative": existing_narrative,
     }
     _make_persist_cb(job_id)("jobInput", payload)
+    if uploaded_documents:
+        _make_persist_cb(job_id)("uploadedDocuments", {"documents": uploaded_documents})
     _QUEUE.put((job_id, "analyze"))
     return job_id
 
@@ -504,10 +516,12 @@ def _dataset_from_checkpoint(checkpoint):
     crit = checkpoint.get("critique") or {}
     rec = checkpoint.get("recommendation_and_map") or {}
     evidence_pool = diag.get("evidencePool") or fs.get("evidencePool") or {}
+    structure_by_source_id = _document_structure_by_source_id(checkpoint)
+    verified_evidence = [_with_document_scope(dict(e), structure_by_source_id) for e in evidence_pool.values() if e.get("verified")]
     return {
-        "caseContext": fetching.get("caseContext"),
+        "caseContext": _case_context_with_narrative_question(fetching.get("caseContext"), fs.get("narrativeQuestion")),
         "sources": fetching.get("sources", []),
-        "evidence": [e for e in evidence_pool.values() if e.get("verified")],
+        "evidence": verified_evidence,
         "strategicFoundation": fs.get("strategicFoundation", []),
         "diagnosis": diag.get("diagnosis", []),
         "competitorContrasts": diag.get("competitorContrasts", []),
@@ -516,6 +530,49 @@ def _dataset_from_checkpoint(checkpoint):
         "narrativeMap": rec.get("narrativeMap"),
         "audiences": rec.get("audiences", []),
     }
+
+
+def _case_context_with_narrative_question(case_context, raw_narrative_question):
+    """Second, independent safety net (layer 1 is pipeline_runner.resolve_narrative_question,
+    called before this value is ever persisted) — read-time derivation, same philosophy as
+    usage/stageProgress/sourceCoverage/evidence scope, so "undefined" in the 'Decision the
+    narrative must resolve' panel is structurally impossible even if a stale or
+    hand-seeded checkpoint ever bypassed layer 1. If strategic_foundation hasn't succeeded
+    yet, case_context itself may be None/absent — returned as-is (nothing to merge into)."""
+    if not case_context:
+        return case_context
+    if isinstance(raw_narrative_question, str) and raw_narrative_question.strip():
+        return {**case_context, "narrativeQuestion": raw_narrative_question.strip()}
+    company_name = (case_context.get("company") or {}).get("name") or "this company"
+    return {**case_context, "narrativeQuestion": f"What should {company_name} be known for, based on what's publicly verifiable?"}
+
+
+def _document_structure_by_source_id(checkpoint):
+    """checkpoint["uploadedDocuments"]["documents"][i]["structureBlocks"] never leaves
+    this process — it's read here, purely to compute a display-only "scope" string below,
+    and is otherwise absent from everything _dataset_from_checkpoint returns."""
+    documents = (checkpoint.get("uploadedDocuments") or {}).get("documents", [])
+    return {d["id"]: d.get("structureBlocks") for d in documents if d.get("structureBlocks")}
+
+
+def _with_document_scope(evidence_item, structure_by_source_id):
+    """Read-time derivation, same philosophy as usage/stageProgress/sourceCoverage
+    (computed fresh on every read, never cached/persisted) — an uploaded-document
+    citation's "Section X — paragraph N" location is a pure function of an already-
+    verified excerpt plus that document's structure map, so there is nothing to keep in
+    sync by computing it here instead of at write time. Every other evidence item (every
+    web source, every seeded Wix/HPS item) has no matching structure map and is returned
+    completely unchanged — this only ever touches items whose sourceId is an uploaded
+    document with structure data available. Never overrides a scope a model itself may
+    have already set (none does today, but this stays a no-op instead of clobbering)."""
+    if evidence_item.get("scope"):
+        return evidence_item
+    blocks = structure_by_source_id.get(evidence_item.get("sourceId"))
+    if blocks:
+        scope = document_extractor.locate_excerpt_scope(evidence_item.get("excerpt", ""), blocks)
+        if scope:
+            evidence_item["scope"] = scope
+    return evidence_item
 
 
 def _set_stage(job_id, stage):
@@ -532,11 +589,14 @@ def _run_job(job_id, action):
         if action == "analyze":
             checkpoint = job_persistence.load_job_state(job_id)
             payload = checkpoint["jobInput"]
+            uploaded_documents = (checkpoint.get("uploadedDocuments") or {}).get("documents", [])
+            uploaded_sources, uploaded_source_text_by_id = document_extractor.documents_to_sources(uploaded_documents)
             persist_cb = _make_persist_cb(job_id)
             result = run_analysis(
                 payload["companyUrl"], payload["supportingUrls"], payload["competitorUrls"],
                 payload["existingNarrative"], progress_cb=lambda stage: _set_stage(job_id, stage),
                 persist_cb=persist_cb,
+                uploaded_sources=uploaded_sources, uploaded_source_text_by_id=uploaded_source_text_by_id,
             )
         elif action == "regenerate":
             checkpoint = job_persistence.load_job_state(job_id)
@@ -565,6 +625,17 @@ def _run_job(job_id, action):
                 progress_cb=lambda stage: _set_stage(job_id, stage),
             )
             case_context = build_case_context(company_doc)
+            # This re-fetch rebuilds `sources` from scratch — it does NOT inherit the
+            # original analyze's uploaded documents or pasted-narrative pseudo-source
+            # automatically (those aren't URLs, so fetch_all_sources knows nothing about
+            # them). Re-merge both here, exactly like create_analyze_job's dispatch does,
+            # so "Add sources" never silently drops an internal document or the pasted
+            # narrative that was part of the analysis a moment ago.
+            uploaded_documents = (checkpoint.get("uploadedDocuments") or {}).get("documents", [])
+            uploaded_sources, uploaded_source_text_by_id = document_extractor.documents_to_sources(uploaded_documents)
+            sources = sources + uploaded_sources
+            source_text_by_id = {**source_text_by_id, **uploaded_source_text_by_id}
+            sources, source_text_by_id = sources_with_pasted_narrative(sources, source_text_by_id, existing_narrative)
             persist_cb("fetching_sources", {
                 "sources": sources, "sourceTextById": source_text_by_id,
                 "fetchFailures": fetch_failures, "caseContext": case_context,
@@ -692,8 +763,9 @@ def _run_retry_job_inner(job_id, stage_name):
     started_at = now_iso()
 
     if stage_name == "strategic_foundation":
-        result = retry_extract_foundation(sources, source_text_by_id, progress_cb=progress_cb)
-        section_update = {"strategicFoundation": result["strategicFoundation"], "evidencePool": result["evidencePool"]}
+        company_name = ((fetching.get("caseContext") or {}).get("company") or {}).get("name")
+        result = retry_extract_foundation(sources, source_text_by_id, existing_narrative, company_name, progress_cb=progress_cb)
+        section_update = {"strategicFoundation": result["strategicFoundation"], "evidencePool": result["evidencePool"], "narrativeQuestion": result["narrativeQuestion"]}
     elif stage_name == "diagnosis":
         fs = checkpoint.get("strategic_foundation") or {}
         result = retry_diagnose(

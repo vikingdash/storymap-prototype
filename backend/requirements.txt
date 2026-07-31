@@ -4,3 +4,4 @@ trafilatura
 beautifulsoup4
 lxml
 python-dotenv
+python-docx

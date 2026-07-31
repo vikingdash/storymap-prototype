@@ -14,6 +14,7 @@ os.environ["ANTHROPIC_API_KEY"] = "sk-test-do-not-use-not-a-real-key"
 
 import anthropic_pipeline as pipe
 import pipeline_runner
+from confidence import compute_confidence_from_links
 from pipeline_runner import (
     GATE_TO_SCORE,
     MAX_FULL_REGENERATIONS,
@@ -44,6 +45,12 @@ from pipeline_runner import (
     run_pipeline_from_sources,
     validate_edited_foundation,
     validate_narrative_map_shape,
+    PASTED_NARRATIVE_SOURCE_ID,
+    COMPANY_POSITION_RELEVANCE,
+    merge_evidence,
+    resolve_narrative_question,
+    sanitize_links,
+    sources_with_pasted_narrative,
 )
 
 
@@ -1367,6 +1374,432 @@ class StageOrderSanity(unittest.TestCase):
             "fetching_sources", "strategic_foundation", "diagnosis",
             "narrative_choices", "critique", "recommendation_and_map",
         ])
+
+
+class SourcesWithPastedNarrative(unittest.TestCase):
+    """Pasted "Existing narrative" text gets folded into sources/source_text_by_id as a
+    synthetic source with documentRole "current_draft_narrative" — the same unification
+    that lets uploaded-file and pasted-text narratives get identical role-aware treatment
+    everywhere downstream, with zero special-casing."""
+
+    def test_empty_existing_narrative_is_a_no_op(self):
+        sources, text_by_id = sources_with_pasted_narrative([], {}, "")
+        self.assertEqual(sources, [])
+        self.assertEqual(text_by_id, {})
+
+    def test_whitespace_only_existing_narrative_is_a_no_op(self):
+        sources, text_by_id = sources_with_pasted_narrative([], {}, "   \n  ")
+        self.assertEqual(sources, [])
+
+    def test_none_existing_narrative_is_a_no_op(self):
+        sources, text_by_id = sources_with_pasted_narrative([], {}, None)
+        self.assertEqual(sources, [])
+
+    def test_non_empty_narrative_injects_a_role_tagged_source(self):
+        sources, text_by_id = sources_with_pasted_narrative([], {}, "  We are the leader in X.  ")
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["id"], PASTED_NARRATIVE_SOURCE_ID)
+        self.assertEqual(sources[0]["sourceType"], "internal")
+        self.assertEqual(sources[0]["documentRole"], "current_draft_narrative")
+        self.assertEqual(text_by_id[PASTED_NARRATIVE_SOURCE_ID], "We are the leader in X.")  # trimmed
+
+    def test_original_sources_are_preserved_alongside_the_injected_one(self):
+        existing = [{"id": "src_live_co", "sourceType": "website"}]
+        sources, text_by_id = sources_with_pasted_narrative(existing, {"src_live_co": "public text"}, "Our story.")
+        self.assertEqual(len(sources), 2)
+        self.assertIn("src_live_co", text_by_id)
+        self.assertIn(PASTED_NARRATIVE_SOURCE_ID, text_by_id)
+
+    def test_idempotent_does_not_double_inject_on_a_second_call(self):
+        sources, text_by_id = sources_with_pasted_narrative([], {}, "Our story.")
+        sources2, text_by_id2 = sources_with_pasted_narrative(sources, text_by_id, "Our story.")
+        self.assertEqual(len(sources2), 1)
+        self.assertEqual(sources2, sources)
+
+    def test_does_not_mutate_the_caller_supplied_lists(self):
+        original_sources = [{"id": "src_live_co", "sourceType": "website"}]
+        original_text_by_id = {"src_live_co": "public text"}
+        sources_with_pasted_narrative(original_sources, original_text_by_id, "Our story.")
+        self.assertEqual(len(original_sources), 1)
+        self.assertEqual(len(original_text_by_id), 1)
+
+
+class ResolveNarrativeQuestionFallback(unittest.TestCase):
+    """The exact fix for 'Decision the narrative must resolve' rendering the literal text
+    "undefined" — resolve_narrative_question is the one place this is guaranteed fixed,
+    regardless of exactly how the model's output was bad."""
+
+    def test_well_formed_string_passes_through_unchanged(self):
+        self.assertEqual(
+            resolve_narrative_question("Is HPS's transformer identity connected to its broader story?", True, "HPS"),
+            "Is HPS's transformer identity connected to its broader story?",
+        )
+
+    def test_well_formed_string_is_trimmed(self):
+        self.assertEqual(resolve_narrative_question("  A real question?  ", False, "Acme"), "A real question?")
+
+    def test_missing_field_falls_back(self):
+        result = resolve_narrative_question(None, False, "Acme")
+        self.assertTrue(result)
+        self.assertNotIn("undefined", result.lower())
+        self.assertNotIn("null", result.lower())
+
+    def test_malformed_integer_falls_back(self):
+        result = resolve_narrative_question(42, False, "Acme")
+        self.assertIsInstance(result, str)
+        self.assertTrue(result)
+
+    def test_malformed_list_falls_back(self):
+        result = resolve_narrative_question(["not", "a", "question"], False, "Acme")
+        self.assertIsInstance(result, str)
+        self.assertTrue(result)
+
+    def test_malformed_dict_falls_back(self):
+        result = resolve_narrative_question({"question": "nested wrong"}, False, "Acme")
+        self.assertIsInstance(result, str)
+        self.assertTrue(result)
+
+    def test_empty_string_falls_back(self):
+        result = resolve_narrative_question("", False, "Acme")
+        self.assertTrue(result)
+
+    def test_whitespace_only_string_falls_back(self):
+        result = resolve_narrative_question("   ", False, "Acme")
+        self.assertTrue(result)
+
+    def test_placeholder_strings_fall_back(self):
+        for placeholder in ("undefined", "null", "None", "N/A", "n/a", "TBD", "narrativeQuestion"):
+            with self.subTest(placeholder=placeholder):
+                result = resolve_narrative_question(placeholder, False, "Acme")
+                self.assertNotEqual(result.lower(), placeholder.lower())
+                self.assertTrue(result)
+
+    def test_never_returns_empty_none_or_falsy(self):
+        for bad_value in (None, "", "   ", 0, False, [], {}, "undefined", "null"):
+            with self.subTest(bad_value=bad_value):
+                result = resolve_narrative_question(bad_value, False, "Acme")
+                self.assertTrue(result)
+                self.assertIsInstance(result, str)
+
+    def test_fallback_differs_when_a_current_draft_narrative_is_present(self):
+        with_draft = resolve_narrative_question(None, True, "HPS")
+        without_draft = resolve_narrative_question(None, False, "HPS")
+        self.assertNotEqual(with_draft, without_draft)
+        self.assertIn("HPS", with_draft)
+        self.assertIn("HPS", without_draft)
+
+    def test_missing_company_name_still_produces_a_valid_question(self):
+        result = resolve_narrative_question(None, False, None)
+        self.assertTrue(result)
+        self.assertIn("this company", result)
+
+
+class RoleAwarePromptPropagation(unittest.TestCase):
+    """End-to-end (through run_analysis, mocking only the network/model boundary — same
+    style as RunPipelineFromSourcesRefactorRegression above) confirmation that BOTH an
+    uploaded current_draft_narrative document and pasted existingNarrative text reach
+    extract_foundation's actual prompt as a role-tagged source — the exact plumbing gap
+    that let the HPS test's two failure-pattern questions through undetected."""
+
+    def setUp(self):
+        self.addCleanup(patch.stopall)
+        self.fetch_return = (
+            [{"id": "src_live_company", "companyId": "live", "title": "Co", "publisher": "co.com",
+              "sourceType": "website", "url": "https://co.com", "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved"}],
+            {"src_live_company": "The company serves manufacturing customers."},
+            [],
+            {"id": "src_live_company", "title": "Co", "publisher": "co.com"},
+        )
+        patch("pipeline_runner.fetch_all_sources", return_value=self.fetch_return).start()
+        patch("anthropic_pipeline.get_client", return_value=object()).start()
+
+        self.captured_sources = []
+
+        def fake_extract_foundation(client, usage_tracker, sources, prior_failure=None):
+            self.captured_sources.append(list(sources))
+            return {
+                "evidence": [EVIDENCE_ITEM("ev1", "src_live_company", "The company serves manufacturing customers.")],
+                "strategicFoundation": [{
+                    "id": "sf1", "type": "customer", "statement": "Serves manufacturing customers.",
+                    "statementType": "source_fact", "evidence": [LINK("ev1")],
+                }],
+                "narrativeQuestion": "Does the story hold together?",
+            }
+
+        patch("anthropic_pipeline.extract_foundation", side_effect=fake_extract_foundation).start()
+        patch("anthropic_pipeline.diagnose", side_effect=lambda *a, **k: {
+            "evidence": [], "diagnosis": [], "competitorOverlapAssessed": False,
+            "competitorOverlapNote": "", "competitorContrasts": [],
+        }).start()
+        patch("anthropic_pipeline.generate_candidates", side_effect=lambda *a, **k: {"candidates": _valid_candidates()}).start()
+        patch("anthropic_pipeline.critique_candidates", side_effect=lambda *a, **k: {"critiques": _valid_critiques(_valid_candidates())}).start()
+        patch("anthropic_pipeline.recommend_and_map", side_effect=lambda *a, **k: dict(_VALID_RECOMMEND_AND_MAP)).start()
+
+    def test_pasted_existing_narrative_reaches_the_prompt_with_the_correct_role(self):
+        run_analysis("https://co.com", [], [], "We are the leader in transformers, expanding broader.", progress_cb=lambda *_: None)
+        sources = self.captured_sources[0]
+        pasted = next((s for s in sources if s["id"] == PASTED_NARRATIVE_SOURCE_ID), None)
+        self.assertIsNotNone(pasted, "pasted narrative source never reached extract_foundation")
+        self.assertEqual(pasted["role"], "current_draft_narrative")
+        self.assertEqual(pasted["text"], "We are the leader in transformers, expanding broader.")
+
+    def test_no_existing_narrative_means_no_pasted_source_and_no_role_anywhere(self):
+        run_analysis("https://co.com", [], [], "", progress_cb=lambda *_: None)
+        sources = self.captured_sources[0]
+        self.assertFalse(any(s["id"] == PASTED_NARRATIVE_SOURCE_ID for s in sources))
+        self.assertFalse(any(s.get("role") for s in sources))
+
+    def test_uploaded_current_draft_narrative_document_reaches_the_prompt_with_the_correct_role(self):
+        uploaded_sources = [{
+            "id": "src_upload_draft", "companyId": "live", "title": "Draft.docx", "publisher": "Internal upload",
+            "sourceType": "internal", "documentRole": "current_draft_narrative",
+            "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved",
+        }]
+        uploaded_text_by_id = {"src_upload_draft": "Uploaded draft narrative text."}
+        run_analysis(
+            "https://co.com", [], [], "", progress_cb=lambda *_: None,
+            uploaded_sources=uploaded_sources, uploaded_source_text_by_id=uploaded_text_by_id,
+        )
+        sources = self.captured_sources[0]
+        uploaded = next((s for s in sources if s["id"] == "src_upload_draft"), None)
+        self.assertIsNotNone(uploaded)
+        self.assertEqual(uploaded["role"], "current_draft_narrative")
+        self.assertEqual(uploaded["text"], "Uploaded draft narrative text.")
+
+    def test_uploaded_other_role_document_reaches_the_prompt_without_current_draft_role(self):
+        uploaded_sources = [{
+            "id": "src_upload_deck", "companyId": "live", "title": "Investor Deck.docx", "publisher": "Internal upload",
+            "sourceType": "internal", "documentRole": "investor_or_financial_material",
+            "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved",
+        }]
+        uploaded_text_by_id = {"src_upload_deck": "Q3 revenue was strong."}
+        run_analysis(
+            "https://co.com", [], [], "", progress_cb=lambda *_: None,
+            uploaded_sources=uploaded_sources, uploaded_source_text_by_id=uploaded_text_by_id,
+        )
+        sources = self.captured_sources[0]
+        uploaded = next((s for s in sources if s["id"] == "src_upload_deck"), None)
+        self.assertEqual(uploaded["role"], "investor_or_financial_material")
+        self.assertFalse(any(s.get("role") == "current_draft_narrative" for s in sources))
+
+    def test_narrative_question_reaches_the_persisted_checkpoint_and_case_context(self):
+        persisted = {}
+        def persist_cb(section, data):
+            persisted[section] = data
+        run_analysis("https://co.com", [], [], "Our story.", progress_cb=lambda *_: None, persist_cb=persist_cb)
+        self.assertEqual(persisted["strategic_foundation"]["narrativeQuestion"], "Does the story hold together?")
+
+
+class NarrativeQuestionNeverUndefinedEndToEnd(unittest.TestCase):
+    """Same run_analysis harness as RoleAwarePromptPropagation, but forcing
+    extract_foundation to return each of the malformed narrativeQuestion shapes the bug
+    report explicitly named — proves the persisted checkpoint never carries "undefined",
+    null, an empty string, or an internal-key-looking value, for every one of them."""
+
+    def setUp(self):
+        self.addCleanup(patch.stopall)
+        fetch_return = (
+            [{"id": "src_live_company", "companyId": "live", "title": "Co", "publisher": "co.com",
+              "sourceType": "website", "url": "https://co.com", "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved"}],
+            {"src_live_company": "The company serves manufacturing customers."},
+            [],
+            {"id": "src_live_company", "title": "Co", "publisher": "co.com"},
+        )
+        patch("pipeline_runner.fetch_all_sources", return_value=fetch_return).start()
+        patch("anthropic_pipeline.get_client", return_value=object()).start()
+        # Only strategic_foundation's response varies per test — the rest just need to
+        # complete without touching the real API, so the checkpoint write this test
+        # actually checks (persisted BEFORE diagnosis even starts) is reachable.
+        patch("anthropic_pipeline.diagnose", side_effect=lambda *a, **k: {
+            "evidence": [], "diagnosis": [], "competitorOverlapAssessed": False,
+            "competitorOverlapNote": "", "competitorContrasts": [],
+        }).start()
+        patch("anthropic_pipeline.generate_candidates", side_effect=lambda *a, **k: {"candidates": _valid_candidates()}).start()
+        patch("anthropic_pipeline.critique_candidates", side_effect=lambda *a, **k: {"critiques": _valid_critiques(_valid_candidates())}).start()
+        patch("anthropic_pipeline.recommend_and_map", side_effect=lambda *a, **k: dict(_VALID_RECOMMEND_AND_MAP)).start()
+
+    def _run_with_foundation_response(self, foundation_response):
+        patch("anthropic_pipeline.extract_foundation", return_value=foundation_response).start()
+        persisted = {}
+        def persist_cb(section, data):
+            persisted[section] = data
+        run_analysis("https://co.com", [], [], "", progress_cb=lambda *_: None, persist_cb=persist_cb)
+        return persisted["strategic_foundation"]["narrativeQuestion"]
+
+    def _assert_valid(self, value):
+        self.assertIsInstance(value, str)
+        self.assertTrue(value.strip())
+        self.assertNotIn(value.strip().lower(), {"undefined", "null", "none", "n/a", "na", "tbd", "narrativequestion", ""})
+
+    def test_missing_key_entirely(self):
+        self._assert_valid(self._run_with_foundation_response({"evidence": [], "strategicFoundation": []}))
+
+    def test_null_value(self):
+        self._assert_valid(self._run_with_foundation_response({"evidence": [], "strategicFoundation": [], "narrativeQuestion": None}))
+
+    def test_malformed_type(self):
+        self._assert_valid(self._run_with_foundation_response({"evidence": [], "strategicFoundation": [], "narrativeQuestion": 7}))
+
+    def test_empty_string(self):
+        self._assert_valid(self._run_with_foundation_response({"evidence": [], "strategicFoundation": [], "narrativeQuestion": ""}))
+
+    def test_well_formed_value_passes_through(self):
+        result = self._run_with_foundation_response({
+            "evidence": [], "strategicFoundation": [],
+            "narrativeQuestion": "Is the transformer-to-broader-electrical story credible?",
+        })
+        self.assertEqual(result, "Is the transformer-to-broader-electrical story credible?")
+
+
+class SanitizeLinksCompanyPositionDowngrade(unittest.TestCase):
+    """The evidence-classification fix: a "direct" EvidenceLink to a source whose
+    documentRole is "current_draft_narrative" is deterministically downgraded to
+    "company_position" — never trusted to the model, never applied to any other
+    relevance value, never applied to an ordinary source."""
+
+    def _pool_with(self, source_id, document_role, verified=True):
+        item = EVIDENCE_ITEM("ev1", source_id, "The company claims X.")
+        item["verified"] = verified
+        item["sourceDocumentRole"] = document_role
+        return {"ev1": item}
+
+    def test_direct_link_to_current_draft_narrative_becomes_company_position(self):
+        pool = self._pool_with("src_pasted_narrative", "current_draft_narrative")
+        kept = sanitize_links("sf1", [LINK("ev1", "direct")], pool, "strategic_foundation", [])
+        self.assertEqual(kept[0]["relevance"], COMPANY_POSITION_RELEVANCE)
+
+    def test_partial_link_to_current_draft_narrative_is_unchanged(self):
+        pool = self._pool_with("src_pasted_narrative", "current_draft_narrative")
+        kept = sanitize_links("sf1", [LINK("ev1", "partial")], pool, "strategic_foundation", [])
+        self.assertEqual(kept[0]["relevance"], "partial")
+
+    def test_context_link_to_current_draft_narrative_is_unchanged(self):
+        pool = self._pool_with("src_pasted_narrative", "current_draft_narrative")
+        kept = sanitize_links("sf1", [LINK("ev1", "context")], pool, "strategic_foundation", [])
+        self.assertEqual(kept[0]["relevance"], "context")
+
+    def test_conflicting_link_to_current_draft_narrative_is_unchanged(self):
+        pool = self._pool_with("src_pasted_narrative", "current_draft_narrative")
+        kept = sanitize_links("sf1", [LINK("ev1", "conflicting")], pool, "strategic_foundation", [])
+        self.assertEqual(kept[0]["relevance"], "conflicting")
+
+    def test_direct_link_to_an_ordinary_website_source_remains_direct(self):
+        pool = self._pool_with("src_live_company", None)
+        kept = sanitize_links("sf1", [LINK("ev1", "direct")], pool, "strategic_foundation", [])
+        self.assertEqual(kept[0]["relevance"], "direct")
+
+    def test_direct_link_to_an_internal_document_with_a_different_role_remains_direct(self):
+        """Only current_draft_narrative triggers the downgrade — an uploaded investor
+        deck or customer-research document is ordinary evidence, exactly as SYSTEM_RULES
+        rule 11 says."""
+        pool = self._pool_with("src_upload_deck", "investor_or_financial_material")
+        kept = sanitize_links("sf1", [LINK("ev1", "direct")], pool, "strategic_foundation", [])
+        self.assertEqual(kept[0]["relevance"], "direct")
+
+    def test_unverified_excerpt_is_still_dropped_before_any_relevance_check(self):
+        """Citation verification is completely independent of and prior to the relevance
+        downgrade — an unverified link never even reaches that check."""
+        pool = self._pool_with("src_pasted_narrative", "current_draft_narrative", verified=False)
+        dropped = []
+        kept = sanitize_links("sf1", [LINK("ev1", "direct")], pool, "strategic_foundation", dropped)
+        self.assertEqual(kept, [])
+        self.assertEqual(len(dropped), 1)
+        self.assertIn("verification", dropped[0]["reason"])
+
+    def test_company_position_never_raises_confidence_same_as_context(self):
+        """The concrete, consequential proof: a statement supported ONLY by a
+        company_position link gets the same low, unestablished confidence as one
+        supported only by context/conflicting links — never boosted like direct/partial."""
+        evidence_by_id = {"ev1": {**EVIDENCE_ITEM("ev1", "src_pasted_narrative", "x"), "strength": "strong"}}
+        company_position_confidence = compute_confidence_from_links([LINK("ev1", COMPANY_POSITION_RELEVANCE)], evidence_by_id)
+        context_confidence = compute_confidence_from_links([LINK("ev1", "context")], evidence_by_id)
+        direct_confidence = compute_confidence_from_links([LINK("ev1", "direct")], evidence_by_id)
+        self.assertEqual(company_position_confidence, context_confidence)
+        self.assertLess(company_position_confidence, direct_confidence)
+
+    def test_merge_evidence_stamps_source_document_role_from_source_roles_by_id(self):
+        pool = {}
+        merge_evidence(
+            pool, [dict(EVIDENCE_ITEM("ev1", "src_pasted_narrative", "The company claims X."))],
+            "f", {"src_pasted_narrative": "The company claims X."}, [], [],
+            source_roles_by_id={"src_pasted_narrative": "current_draft_narrative"},
+        )
+        self.assertEqual(pool["ev1"]["sourceDocumentRole"], "current_draft_narrative")
+
+    def test_merge_evidence_stamps_none_when_source_roles_by_id_omitted(self):
+        pool = {}
+        merge_evidence(pool, [dict(EVIDENCE_ITEM("ev1", "src_live_company", "x"))], "f", {"src_live_company": "x"}, [], [])
+        self.assertIsNone(pool["ev1"]["sourceDocumentRole"])
+
+
+class PastedAndUploadedNarrativeParity(unittest.TestCase):
+    """The company_position downgrade must behave identically whether the
+    current_draft_narrative source came from pasted text or an uploaded .docx — both are
+    shaped identically by the time sanitize_links/merge_evidence see them, so this proves
+    that structural claim end to end rather than assuming it."""
+
+    def setUp(self):
+        self.addCleanup(patch.stopall)
+        self.fetch_return = (
+            [{"id": "src_live_company", "companyId": "live", "title": "Co", "publisher": "co.com",
+              "sourceType": "website", "url": "https://co.com", "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved"}],
+            {"src_live_company": "The company serves manufacturing customers."},
+            [],
+            {"id": "src_live_company", "title": "Co", "publisher": "co.com"},
+        )
+        patch("pipeline_runner.fetch_all_sources", return_value=self.fetch_return).start()
+        patch("anthropic_pipeline.get_client", return_value=object()).start()
+        patch("anthropic_pipeline.diagnose", side_effect=lambda *a, **k: {
+            "evidence": [], "diagnosis": [], "competitorOverlapAssessed": False,
+            "competitorOverlapNote": "", "competitorContrasts": [],
+        }).start()
+        patch("anthropic_pipeline.generate_candidates", side_effect=lambda *a, **k: {"candidates": _valid_candidates()}).start()
+        patch("anthropic_pipeline.critique_candidates", side_effect=lambda *a, **k: {"critiques": _valid_critiques(_valid_candidates())}).start()
+        patch("anthropic_pipeline.recommend_and_map", side_effect=lambda *a, **k: dict(_VALID_RECOMMEND_AND_MAP)).start()
+
+    def _run_and_get_link(self, **run_analysis_kwargs):
+        def fake_extract_foundation(client, usage_tracker, sources, prior_failure=None):
+            narrative_source = next(s for s in sources if s.get("role") == "current_draft_narrative")
+            return {
+                "evidence": [EVIDENCE_ITEM("ev1", narrative_source["id"], "We are the leader in X.")],
+                "strategicFoundation": [{
+                    "id": "sf1", "type": "way_to_win", "statement": "The company claims leadership in X.",
+                    "statementType": "source_fact", "evidence": [LINK("ev1", "direct")],
+                }],
+                "narrativeQuestion": "Does the story hold together?",
+            }
+        patch("anthropic_pipeline.extract_foundation", side_effect=fake_extract_foundation).start()
+        result = run_analysis("https://co.com", [], [], progress_cb=lambda *_: None, **run_analysis_kwargs)
+        return result["dataset"]["strategicFoundation"][0]["evidence"][0]
+
+    def test_pasted_narrative_downgrades_to_company_position(self):
+        link = self._run_and_get_link(existing_narrative="We are the leader in X.")
+        self.assertEqual(link["relevance"], COMPANY_POSITION_RELEVANCE)
+
+    def test_uploaded_narrative_downgrades_to_company_position(self):
+        uploaded_sources = [{
+            "id": "src_upload_draft", "companyId": "live", "title": "Draft.docx", "publisher": "Internal upload",
+            "sourceType": "internal", "documentRole": "current_draft_narrative",
+            "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved",
+        }]
+        uploaded_text_by_id = {"src_upload_draft": "We are the leader in X."}
+        link = self._run_and_get_link(
+            existing_narrative="", uploaded_sources=uploaded_sources, uploaded_source_text_by_id=uploaded_text_by_id,
+        )
+        self.assertEqual(link["relevance"], COMPANY_POSITION_RELEVANCE)
+
+    def test_both_paths_produce_the_same_relevance_value(self):
+        pasted_link = self._run_and_get_link(existing_narrative="We are the leader in X.")
+        uploaded_sources = [{
+            "id": "src_upload_draft", "companyId": "live", "title": "Draft.docx", "publisher": "Internal upload",
+            "sourceType": "internal", "documentRole": "current_draft_narrative",
+            "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved",
+        }]
+        uploaded_text_by_id = {"src_upload_draft": "We are the leader in X."}
+        uploaded_link = self._run_and_get_link(
+            existing_narrative="", uploaded_sources=uploaded_sources, uploaded_source_text_by_id=uploaded_text_by_id,
+        )
+        self.assertEqual(pasted_link["relevance"], uploaded_link["relevance"])
 
 
 if __name__ == "__main__":
