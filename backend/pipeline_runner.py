@@ -65,13 +65,46 @@ SONNET5_OUTPUT_PER_MTOK = 10.0
 
 # Deterministic, disclosed mapping from the critique stage's categorical gates to the 1-5
 # numeric scale the existing NarrativeChoices.js/scoring.js already render — never model
-# generated. "weak"/"partial" sit exactly at the pass threshold (>=3 in scoring.js's
-# MIN_SCORE_THRESHOLDS) so the frontend's own independent gate check reaches the same
-# accept/reject conclusion this backend's hard-gate logic already computed; "fails"/
-# "unsupported" always fall below it. "Customer relevance" and "Durability" are
-# deliberately never included — this pipeline never fabricates a customer-relevance score
-# without customer evidence, and durability isn't assessed by the critique stage at all.
+# generated. "weak"/"partial" sit exactly at the pass threshold (>=3) so a borderline pass
+# is still visibly a pass, not silently rounded up to look identical to "meets"/"supported".
+# "Customer relevance" and "Durability" are deliberately never included — this pipeline
+# never fabricates a customer-relevance score without customer evidence, and durability
+# isn't assessed by the critique stage at all.
 GATE_TO_SCORE = {"meets": 4, "weak": 3, "fails": 1, "supported": 4, "partial": 3, "unsupported": 1}
+
+# Governing-spec Phase 1 canonical candidate status vocabulary. Exactly three values, each
+# meaning one thing regardless of which pipeline stage last touched it (see
+# build_candidate_scores_and_status/process_candidates_response/process_critique_response):
+#   pending  — generated (narrative_choices), not yet evaluated by critique
+#   viable   — passed every critique gate; MAY be shown as "Recommended" by the frontend
+#              when its id matches recommendation.selectedCandidateId, but that is derived
+#              at render time, never a fourth persisted status value (decision 1)
+#   rejected — failed at least one critique gate
+# Once set at critique, a candidate's status/gateResults/rejectionReasons are never
+# rewritten again — see process_recommend_and_map_response, which only ever records the
+# winner in the separate `recommendation.selectedCandidateId` field.
+CANDIDATE_STATUS_PENDING = "pending"
+CANDIDATE_STATUS_VIABLE = "viable"
+CANDIDATE_STATUS_REJECTED = "rejected"
+
+# Per-gate criterion label + machine-readable id, used to build the structured
+# candidate.gateResults entries (governing spec Phase 1, decision 3) — one entry per
+# critique gate, always present once critique has run, so the frontend never has to parse
+# criticFindings prose to know why a candidate passed or failed.
+GATE_CRITERIA = [
+    ("strategicFitGate", "Strategic fit"),
+    ("differentiationGate", "Differentiation"),
+    ("evidenceSupportGate", "Evidence strength"),
+]
+GATE_PASS_THRESHOLD = 3
+# "weak"/"partial" map to "borderline_pass" rather than a plain "pass" specifically so a
+# borderline margin stays visible for later human review (decision 3's explicit
+# requirement) instead of looking identical to a comfortable "meets"/"supported" pass.
+GATE_OUTCOME_LABELS = {
+    "meets": "pass", "supported": "pass",
+    "weak": "borderline_pass", "partial": "borderline_pass",
+    "fails": "fail", "unsupported": "fail",
+}
 
 # Same non-absolute ceiling used elsewhere in this app (case-utils.js's MAX_CONFIDENCE) —
 # even a verified-exact-match excerpt doesn't get shown as 100% certain.
@@ -96,18 +129,38 @@ def compute_cost(totals):
     )
 
 
-def build_candidate_scores_and_status(gate):
+def build_candidate_scores_and_status(gate, evaluated_at_stage="critique"):
     """Pure and unit-testable on its own: translates a critique gate assessment
     (categorical, from the model) into the candidate's numeric scores (deterministic
-    GATE_TO_SCORE lookup — never model-generated) and pass/fail status. Never includes
-    "Customer relevance" or "Durability" — see GATE_TO_SCORE's docstring for why."""
-    fails = gate["strategicFitGate"] == "fails" or gate["differentiationGate"] == "fails" or gate["evidenceSupportGate"] == "unsupported"
-    scores = {
-        "Strategic fit": GATE_TO_SCORE[gate["strategicFitGate"]],
-        "Differentiation": GATE_TO_SCORE[gate["differentiationGate"]],
-        "Evidence strength": GATE_TO_SCORE[gate["evidenceSupportGate"]],
-    }
-    return scores, ("rejected" if fails else "candidate")
+    GATE_TO_SCORE lookup — never model-generated), canonical status, and the structured
+    gateResults/rejectionReasons the governing spec's Phase 1 decision 3 requires (machine-
+    readable outcome, visible explanation, traceability to the gate, no parsing of prose to
+    determine status). Never includes "Customer relevance" or "Durability" — see
+    GATE_TO_SCORE's docstring for why. Returns (scores, status, gate_results,
+    rejection_reasons)."""
+    scores = {}
+    gate_results = []
+    for gate_id, criterion in GATE_CRITERIA:
+        raw = gate[gate_id]
+        score = GATE_TO_SCORE[raw]
+        scores[criterion] = score
+        gate_results.append({
+            "gateId": gate_id,
+            "criterion": criterion,
+            "outcome": GATE_OUTCOME_LABELS[raw],
+            "score": score,
+            "threshold": GATE_PASS_THRESHOLD,
+            "margin": score - GATE_PASS_THRESHOLD,
+            "explanation": f'{criterion} assessed as "{raw}".',
+            "evaluatedAtStage": evaluated_at_stage,
+        })
+    fails = any(gr["outcome"] == "fail" for gr in gate_results)
+    status = CANDIDATE_STATUS_REJECTED if fails else CANDIDATE_STATUS_VIABLE
+    rejection_reasons = [
+        {"code": f'{gr["gateId"]}_failed', "gateId": gr["gateId"], "explanation": gr["explanation"]}
+        for gr in gate_results if gr["outcome"] == "fail"
+    ] if fails else []
+    return scores, status, gate_results, rejection_reasons
 
 
 class PipelineError(Exception):
@@ -147,6 +200,41 @@ class SourceExpansionLimitReachedError(ValueError):
     RegenerationLimitReachedError; see MAX_SOURCE_EXPANSIONS's docstring for why the two
     are never shared."""
     pass
+
+
+class RecommendationValidationError(ValueError):
+    """Raised when the model's recommendedCandidateId doesn't reference one of the
+    candidates that actually survived critique (governing spec Phase 1: "success requires
+    a valid selectedCandidateId referencing a viable candidate"). Caught by the same
+    attempt/retry machinery as every other stage-specific validation failure — see
+    ATTEMPT_EXCEPTIONS below — so a model hallucinating an id costs a retry, not a crash."""
+    pass
+
+
+def build_recommendation_state(outcome, selected_candidate_id=None, failure_reason=None, missing_evidence=None, leadership_decisions=None, detail=None):
+    """The one place the canonical recommendation-outcome object (governing spec Phase 1)
+    is ever constructed — every call site (run_pipeline_from_sources, regenerate_from,
+    retry_recommendation_and_map) builds it here via this single function, so
+    success/no_candidate_passed/stage_failed always produce the exact same shape regardless
+    of entry point, and regardless of whether recommendation_and_map ran at all (unlike
+    before, this is now ALSO built and persisted for no_candidate_passed — previously that
+    branch returned without ever calling persist_cb for this stage, which is the exact
+    mechanism behind the checkpoint.recommendation_and_map == None ambiguity between
+    no_candidate_passed and stage_failed that this schema exists to eliminate).
+
+    Selection lives ONLY here (selectedCandidateId) — never as a second candidate.status
+    value; see process_recommend_and_map_response, which no longer rewrites candidate
+    status at all (decision 1: a selected candidate remains structurally "viable").
+    """
+    return {
+        "outcome": outcome,
+        "selectedCandidateId": selected_candidate_id,
+        "failureReason": failure_reason,
+        "missingEvidence": list(missing_evidence) if missing_evidence else [],
+        "leadershipDecisions": list(leadership_decisions) if leadership_decisions else [],
+        "createdAt": now_iso(),
+        "detail": detail,
+    }
 
 
 def filter_malformed_records(items, required_keys, stage, rejected_records_report, record_kind="record"):
@@ -442,11 +530,19 @@ def process_candidates_response(response, evidence_pool, dropped_links_report, r
         rejected_records_report.append({"stage": "candidates", "id": None, "reasons": [f"expected exactly 3 candidates, got {len(candidates)}"]})
     for cand in candidates:
         cand["claims"] = sanitize_links(cand["id"], cand["claims"], evidence_pool, "candidates", dropped_links_report)
-        cand["status"] = "candidate"
+        cand["status"] = CANDIDATE_STATUS_PENDING
+        cand["gateResults"] = []
+        cand["rejectionReasons"] = []
+        cand["statusEvaluatedAtStage"] = "narrative_choices"
+        cand["statusUpdatedAt"] = now_iso()
     return candidates
 
 
 def process_critique_response(response, candidates, rejected_records_report):
+    """Sets each candidate's status/gateResults/rejectionReasons exactly once — this is the
+    FIRST and ONLY time a candidate's evaluated-viability is ever written (see decision 1:
+    process_recommend_and_map_response never touches candidate status again, it only
+    records the winner separately in recommendation.selectedCandidateId)."""
     raw_critiques = filter_malformed_records(response["critiques"], CRITIQUE_REQUIRED_KEYS, "critique", rejected_records_report, "critique")
     gates_by_id = {c["candidateId"]: c for c in raw_critiques}
     survivors, rejected = [], []
@@ -454,23 +550,36 @@ def process_critique_response(response, candidates, rejected_records_report):
         gate = gates_by_id.get(cand["id"])
         if gate is None:
             rejected_records_report.append({"stage": "critique", "id": cand["id"], "reasons": ["no critique returned for this candidate"]})
-            cand["status"] = "rejected"
+            cand["status"] = CANDIDATE_STATUS_REJECTED
             cand["scores"] = {"Strategic fit": 1, "Differentiation": 1, "Evidence strength": 1}
             cand["criticFindings"] = ["No critique was returned for this candidate — treated as failing."]
+            cand["gateResults"] = []
+            cand["rejectionReasons"] = [{"code": "no_critique_returned", "gateId": None, "explanation": "No critique was returned for this candidate — treated as failing."}]
+            cand["statusEvaluatedAtStage"] = "critique"
+            cand["statusUpdatedAt"] = now_iso()
             rejected.append(cand)
             continue
-        cand["scores"], cand["status"] = build_candidate_scores_and_status(gate)
+        cand["scores"], cand["status"], cand["gateResults"], cand["rejectionReasons"] = build_candidate_scores_and_status(gate)
         cand["criticFindings"] = gate["findings"]
-        (rejected if cand["status"] == "rejected" else survivors).append(cand)
+        cand["statusEvaluatedAtStage"] = "critique"
+        cand["statusUpdatedAt"] = now_iso()
+        (rejected if cand["status"] == CANDIDATE_STATUS_REJECTED else survivors).append(cand)
     return candidates, survivors
 
 
 def process_recommend_and_map_response(response, survivors, all_candidates, evidence_pool, dropped_links_report, rejected_records_report, map_id, map_version):
     winner_id = response["recommendedCandidateId"]
-    for cand in all_candidates:
-        cand["status"] = "recommended" if cand["id"] == winner_id else ("candidate" if cand in survivors else "rejected")
+    survivor_ids = {c["id"] for c in survivors}
+    if winner_id not in survivor_ids:
+        raise RecommendationValidationError(
+            f"recommendedCandidateId {winner_id!r} does not reference a candidate that survived critique"
+        )
+    # Candidate status/gateResults/rejectionReasons are never rewritten here — they were
+    # set once, at critique (see process_critique_response), and stay exactly as they were.
+    # Selection is recorded only in the caller's recommendation.selectedCandidateId; a
+    # selected candidate remains structurally "viable" (decision 1).
     why_others = response["whyOthersNotSelected"]
-    recommendation = {
+    detail = {
         "candidateId": winner_id,
         "recommendedDecision": response["recommendedDecision"],
         "whyItWins": response["whyItWins"],
@@ -507,7 +616,7 @@ def process_recommend_and_map_response(response, survivors, all_candidates, evid
         "unresolvedQuestions": nm["unresolvedQuestions"],
         "createdAt": datetime.now(timezone.utc).isoformat(),
     }
-    return recommendation, narrative_map, audiences
+    return detail, narrative_map, audiences
 
 
 # --- Generic stage-attempt / stage-retry machinery ---------------------------------------
@@ -516,7 +625,7 @@ def process_recommend_and_map_response(response, survivors, all_candidates, evid
 # exception (auth, network, rate limit) is NOT in this tuple and propagates immediately,
 # uncaught, exactly like PipelineError does. That is what makes "do not retry hard
 # failures" true by construction rather than by a separate check.
-ATTEMPT_EXCEPTIONS = (StageResponseError, KeyError, TypeError, StopIteration, NarrativeMapValidationError)
+ATTEMPT_EXCEPTIONS = (StageResponseError, KeyError, TypeError, StopIteration, NarrativeMapValidationError, RecommendationValidationError)
 
 
 def _attempt_stage_once(stage_name, required_schema, api_call_fn, process_fn, usage, prior_failure):
@@ -1104,7 +1213,13 @@ def run_pipeline_from_sources(sources, source_text_by_id, existing_narrative, ca
     persist_cb("critique", {"outcome": "success", "attempts": attempts, "candidates": candidates})
 
     if not survivors:
-        return _empty_return("no_candidate_passed", None, None, strategic_foundation, diagnosis, candidates, competitor_contrasts, None, None, [], evidence_pool)
+        # Now ALWAYS persisted (previously this branch returned without ever calling
+        # persist_cb for this stage — the exact gap behind the recommendation_and_map ==
+        # None ambiguity between no_candidate_passed and stage_failed). recommendation is
+        # the canonical outcome object itself, never None, once critique has completed.
+        no_candidate_state = build_recommendation_state("no_candidate_passed")
+        persist_cb("recommendation_and_map", {"outcome": "no_candidate_passed", "attempts": [], "recommendation": no_candidate_state})
+        return _empty_return("no_candidate_passed", None, None, strategic_foundation, diagnosis, candidates, competitor_contrasts, no_candidate_state, None, [], evidence_pool)
 
     # --- Stage: recommendation_and_map ---
     rec_result, outcome, stage_failure, tb, attempts = run_model_stage(
@@ -1114,9 +1229,19 @@ def run_pipeline_from_sources(sources, source_text_by_id, existing_narrative, ca
         usage, progress_cb,
     )
     if outcome == "stage_failed":
-        persist_cb("recommendation_and_map", {"outcome": outcome, "attempts": attempts})
-        return _empty_return(outcome, stage_failure, tb, strategic_foundation, diagnosis, candidates, competitor_contrasts, None, None, [], evidence_pool)
-    recommendation, narrative_map, audiences = rec_result
+        stage_failed_state = build_recommendation_state("stage_failed", failure_reason=stage_failure["validation_error"])
+        persist_cb("recommendation_and_map", {"outcome": outcome, "attempts": attempts, "recommendation": stage_failed_state})
+        # strategic_foundation/diagnosis/candidates are passed through UNCHANGED from
+        # before this stage ran — this is what makes "stage_failed preserves all earlier
+        # candidate statuses, evidence, diagnosis, critique, scores, and partial results"
+        # true by construction rather than by a separate preservation step.
+        return _empty_return(outcome, stage_failure, tb, strategic_foundation, diagnosis, candidates, competitor_contrasts, stage_failed_state, None, [], evidence_pool)
+    detail, narrative_map, audiences = rec_result
+    recommendation = build_recommendation_state(
+        "success", selected_candidate_id=detail["candidateId"],
+        missing_evidence=detail["missingEvidence"], leadership_decisions=narrative_map["unresolvedQuestions"],
+        detail=detail,
+    )
     persist_cb("recommendation_and_map", {"outcome": "success", "attempts": attempts, "recommendation": recommendation, "narrativeMap": narrative_map, "audiences": audiences})
 
     return _empty_return("success", None, None, strategic_foundation, diagnosis, candidates, competitor_contrasts, recommendation, narrative_map, audiences, evidence_pool)
@@ -1206,7 +1331,9 @@ def regenerate_from(sources, source_text_by_id, evidence_pool, edited_foundation
     persist_cb("critique", {"outcome": "success", "attempts": attempts, "candidates": candidates})
 
     if not survivors:
-        return _empty_return("no_candidate_passed", None, None, diagnosis, candidates, competitor_contrasts, None, None, [])
+        no_candidate_state = build_recommendation_state("no_candidate_passed")
+        persist_cb("recommendation_and_map", {"outcome": "no_candidate_passed", "attempts": [], "recommendation": no_candidate_state})
+        return _empty_return("no_candidate_passed", None, None, diagnosis, candidates, competitor_contrasts, no_candidate_state, None, [])
 
     rec_result, outcome, stage_failure, tb, attempts = run_model_stage(
         "recommendation_and_map", RECOMMEND_AND_MAP_RESPONSE_SCHEMA,
@@ -1215,9 +1342,15 @@ def regenerate_from(sources, source_text_by_id, evidence_pool, edited_foundation
         usage, progress_cb,
     )
     if outcome == "stage_failed":
-        persist_cb("recommendation_and_map", {"outcome": outcome, "attempts": attempts})
-        return _empty_return(outcome, stage_failure, tb, diagnosis, candidates, competitor_contrasts, None, None, [])
-    recommendation, narrative_map, audiences = rec_result
+        stage_failed_state = build_recommendation_state("stage_failed", failure_reason=stage_failure["validation_error"])
+        persist_cb("recommendation_and_map", {"outcome": outcome, "attempts": attempts, "recommendation": stage_failed_state})
+        return _empty_return(outcome, stage_failure, tb, diagnosis, candidates, competitor_contrasts, stage_failed_state, None, [])
+    detail, narrative_map, audiences = rec_result
+    recommendation = build_recommendation_state(
+        "success", selected_candidate_id=detail["candidateId"],
+        missing_evidence=detail["missingEvidence"], leadership_decisions=narrative_map["unresolvedQuestions"],
+        detail=detail,
+    )
     persist_cb("recommendation_and_map", {"outcome": "success", "attempts": attempts, "recommendation": recommendation, "narrativeMap": narrative_map, "audiences": audiences})
 
     return _empty_return("success", None, None, diagnosis, candidates, competitor_contrasts, recommendation, narrative_map, audiences)
@@ -1356,10 +1489,11 @@ def retry_recommendation_and_map(candidates, evidence_pool, foundation_summary, 
     usage = pipe.UsageTracker()
     dropped_links_report, rejected_records_report = [], []
 
-    survivors = [c for c in candidates if c.get("status") != "rejected"]
+    survivors = [c for c in candidates if c.get("status") != CANDIDATE_STATUS_REJECTED]
     if not survivors:
+        no_candidate_state = build_recommendation_state("no_candidate_passed")
         diagnostics = {"outcome": "no_candidate_passed", "failure_reason": None, "dropped_links": [], "rejected_records": [], "api_calls": usage.calls, "token_totals": usage.totals()}
-        return {"recommendation": None, "narrativeMap": None, "audiences": [], "candidates": candidates,
+        return {"recommendation": no_candidate_state, "narrativeMap": None, "audiences": [], "candidates": candidates,
                 "outcome": "no_candidate_passed", "diagnostics": diagnostics, "debug_traceback": None}
 
     progress_cb("recommendation_and_map")
@@ -1369,8 +1503,17 @@ def retry_recommendation_and_map(candidates, evidence_pool, foundation_summary, 
         lambda response: process_recommend_and_map_response(response, survivors, candidates, evidence_pool, dropped_links_report, rejected_records_report, "map_live_retry", 1),
         usage, prior_failure,
     )
-    recommendation, narrative_map, audiences = result if outcome == "success" else (None, None, [])
     outcome = "stage_failed" if outcome == "failed" else outcome
+    if outcome == "success":
+        detail, narrative_map, audiences = result
+        recommendation = build_recommendation_state(
+            "success", selected_candidate_id=detail["candidateId"],
+            missing_evidence=detail["missingEvidence"], leadership_decisions=narrative_map["unresolvedQuestions"],
+            detail=detail,
+        )
+    else:
+        narrative_map, audiences = None, []
+        recommendation = build_recommendation_state("stage_failed", failure_reason=error_info["validation_error"] if error_info else None)
     diagnostics = {
         "outcome": outcome, "failure_reason": error_info["validation_error"] if error_info else None,
         "dropped_links": dropped_links_report, "rejected_records": rejected_records_report,

@@ -5,15 +5,21 @@
 // analysis." The main cards deliberately show no numeric score at all — a decimal like "4.6/5"
 // implies a precision the underlying judgment doesn't have, on a corpus of six sources. Instead
 // each candidate gets one of three qualitative labels (Recommended / Viable alternative / Does
-// not pass [criterion] threshold), derived from computeOverallScore() in scoring.js. The 1-5
+// not pass [criterion] threshold), derived from the canonical persisted candidate.status/
+// gateResults/rejectionReasons (governing spec Phase 1) — this screen never recomputes
+// viability itself; candidate-state.js's normalizeCandidates() already produced the one
+// canonical status every other screen (Recommendation, Narrative Map) reads too. "Recommended"
+// is likewise never a persisted candidate status — it's derived here purely by comparing the
+// candidate's id against the separately-fetched recommendation's selectedCandidateId. The 1-5
 // criterion numbers still exist and are still real — they're just one click away, not front and
 // center implying false certainty.
 import { escapeHtml } from "../labels.js";
-import { scoreBarWidthPercent, formatScore, computeOverallScore, SCORE_RUBRIC } from "../scoring.js";
+import { scoreBarWidthPercent, formatScore, SCORE_RUBRIC } from "../scoring.js";
 
 export async function renderNarrativeChoices(container, { service, drawer, onNavigate }) {
   container.innerHTML = `<div class="loading">Generating narrative choices…</div>`;
-  const candidates = await service.getCandidates();
+  const [candidates, recommendation] = await Promise.all([service.getCandidates(), service.getRecommendation()]);
+  const selectedCandidateId = recommendation && recommendation.outcome === "success" ? recommendation.selectedCandidateId : null;
 
   container.innerHTML = `
     <section class="screen-header">
@@ -28,24 +34,25 @@ export async function renderNarrativeChoices(container, { service, drawer, onNav
   `;
 
   const grid = container.querySelector(".candidates-grid");
-  candidates.forEach((c) => grid.appendChild(renderCandidateCard(c, drawer)));
+  candidates.forEach((c) => grid.appendChild(renderCandidateCard(c, drawer, selectedCandidateId)));
 
   container.querySelector('[data-action="continue"]').addEventListener("click", () => onNavigate("recommendation"));
 }
 
-function categorizeCandidate(candidate) {
-  const overall = computeOverallScore(candidate.scores);
-  if (overall.blocked) {
-    return { label: `Does not pass ${overall.failing[0].criterion} threshold`, statusClass: "status-blocked" };
+function categorizeCandidate(candidate, selectedCandidateId) {
+  if (candidate.status === "rejected") {
+    const failingGate = (candidate.gateResults || []).find((g) => g.outcome === "fail");
+    const label = failingGate ? `Does not pass ${failingGate.criterion} threshold` : "Does not pass StoryMap's evidence and differentiation bar";
+    return { label, statusClass: "status-blocked" };
   }
-  if (candidate.status === "recommended") {
+  if (candidate.id === selectedCandidateId) {
     return { label: "Recommended", statusClass: "status-recommended" };
   }
   return { label: "Viable alternative", statusClass: "status-viable" };
 }
 
-function renderOverallStatus(candidate) {
-  const { label, statusClass } = categorizeCandidate(candidate);
+function renderOverallStatus(candidate, selectedCandidateId) {
+  const { label, statusClass } = categorizeCandidate(candidate, selectedCandidateId);
   return `
     <div class="overall-status ${statusClass}">
       <span class="score-label">Overall assessment</span>
@@ -54,8 +61,8 @@ function renderOverallStatus(candidate) {
   `;
 }
 
-function renderCandidateCard(candidate, drawer) {
-  const isRecommended = candidate.status === "recommended";
+function renderCandidateCard(candidate, drawer, selectedCandidateId) {
+  const isRecommended = candidate.id === selectedCandidateId;
   const el = document.createElement("div");
   el.className = `candidate-card${isRecommended ? " recommended" : ""}`;
 
@@ -94,7 +101,7 @@ function renderCandidateCard(candidate, drawer) {
       <p class="muted">${escapeHtml(candidate.differentiation)}</p>
     </div>
     <div class="candidate-section">
-      ${renderOverallStatus(candidate)}
+      ${renderOverallStatus(candidate, selectedCandidateId)}
     </div>
     <div class="candidate-section">
       <h4>Primary trade-off</h4>

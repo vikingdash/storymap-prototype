@@ -108,6 +108,233 @@ class MissingCorruptedIncompatible(JobPersistenceTestCase):
             self.assertIsNone(result)  # unreachable if raised correctly
 
 
+class SchemaMigrationV1ToV2(JobPersistenceTestCase):
+    """Governing spec Phase 1: JOB_STATE_SCHEMA_VERSION bumped 1 -> 2 for the canonical
+    candidate status vocabulary (pending/viable/rejected, replacing the overloaded
+    "candidate"/"recommended") and the explicit recommendation{outcome,
+    selectedCandidateId, failureReason, missingEvidence, leadershipDecisions, createdAt}
+    object. Every test here writes a raw v1-shaped file directly to disk (bypassing
+    save_job_state, which always stamps the CURRENT version) so load_job_state's
+    migration path is exercised exactly as a real pre-existing checkpoint would hit it."""
+
+    def _write_v1(self, job_id, body):
+        job_dir = os.path.join(self._tmp_root, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        with open(os.path.join(job_dir, job_persistence.CHECKPOINT_FILENAME), "w") as f:
+            json.dump({"schemaVersion": 1, "savedAt": 1234.0, **body}, f)
+
+    def test_v1_checkpoint_loads_without_raising(self):
+        self._write_v1("job1", {"meta": {"status": "running"}})
+        loaded = job_persistence.load_job_state("job1")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["schemaVersion"], 2)
+        self.assertEqual(loaded["schemaMigratedFrom"], 1)
+        self.assertIn("schemaMigratedAt", loaded)
+
+    def test_migration_never_overwrites_the_original_file_on_disk(self):
+        """'no automatic overwrite of the original version-1 checkpoint' — load_job_state
+        must be read-only with respect to the file; only an explicit later save_job_state
+        call for this job_id is allowed to persist the migrated shape."""
+        self._write_v1("job1", {"meta": {"status": "running"}})
+        path = os.path.join(self._tmp_root, "job1", job_persistence.CHECKPOINT_FILENAME)
+        with open(path) as f:
+            before = f.read()
+        job_persistence.load_job_state("job1")
+        with open(path) as f:
+            after = f.read()
+        self.assertEqual(before, after)
+
+    def test_unmigrated_sections_pass_through_unchanged(self):
+        self._write_v1("job1", {"meta": {"status": "running"}, "fetching_sources": {"sources": [{"id": "s1"}]}})
+        loaded = job_persistence.load_job_state("job1")
+        self.assertEqual(loaded["fetching_sources"], {"sources": [{"id": "s1"}]})
+
+    def test_narrative_choices_candidate_status_migrates_to_pending(self):
+        self._write_v1("job1", {
+            "meta": {"status": "running"},
+            "narrative_choices": {"outcome": "success", "candidates": [{"id": "c1", "status": "candidate"}]},
+        })
+        loaded = job_persistence.load_job_state("job1")
+        cand = loaded["narrative_choices"]["candidates"][0]
+        self.assertEqual(cand["status"], "pending")
+        self.assertEqual(cand["gateResults"], [])
+        self.assertEqual(cand["rejectionReasons"], [])
+        self.assertEqual(cand["statusEvaluatedAtStage"], "narrative_choices")
+
+    def test_critique_candidate_status_candidate_migrates_to_viable(self):
+        self._write_v1("job1", {
+            "meta": {"status": "done"},
+            "critique": {"outcome": "success", "candidates": [
+                {"id": "c1", "status": "candidate", "scores": {"Strategic fit": 4, "Differentiation": 4, "Evidence strength": 3}},
+            ]},
+        })
+        loaded = job_persistence.load_job_state("job1")
+        cand = loaded["critique"]["candidates"][0]
+        self.assertEqual(cand["status"], "viable")
+        self.assertEqual(cand["statusEvaluatedAtStage"], "critique")
+        gate_ids = {g["gateId"] for g in cand["gateResults"]}
+        self.assertEqual(gate_ids, {"strategic_fit", "differentiation", "evidence_strength"})
+
+    def test_critique_candidate_status_recommended_also_migrates_to_viable(self):
+        """The old third status value ("recommended", written only by
+        process_recommend_and_map_response on success) no longer exists — a selected
+        candidate is structurally "viable"; selection lives only in
+        recommendation.selectedCandidateId (decision 1)."""
+        self._write_v1("job1", {
+            "meta": {"status": "done"},
+            "critique": {"outcome": "success", "candidates": [
+                {"id": "c1", "status": "recommended", "scores": {"Strategic fit": 4, "Differentiation": 4, "Evidence strength": 4}},
+            ]},
+        })
+        loaded = job_persistence.load_job_state("job1")
+        self.assertEqual(loaded["critique"]["candidates"][0]["status"], "viable")
+
+    def test_critique_candidate_status_rejected_stays_rejected_with_synthesized_reasons(self):
+        self._write_v1("job1", {
+            "meta": {"status": "done"},
+            "critique": {"outcome": "success", "candidates": [
+                {"id": "c1", "status": "rejected", "scores": {"Strategic fit": 1, "Differentiation": 3, "Evidence strength": 3}},
+            ]},
+        })
+        loaded = job_persistence.load_job_state("job1")
+        cand = loaded["critique"]["candidates"][0]
+        self.assertEqual(cand["status"], "rejected")
+        self.assertTrue(cand["rejectionReasons"])
+        self.assertEqual(cand["rejectionReasons"][0]["gateId"], "strategic_fit")
+
+    def test_borderline_score_of_exactly_threshold_migrates_to_borderline_pass(self):
+        self._write_v1("job1", {
+            "meta": {"status": "done"},
+            "critique": {"outcome": "success", "candidates": [
+                {"id": "c1", "status": "candidate", "scores": {"Strategic fit": 3, "Differentiation": 4, "Evidence strength": 4}},
+            ]},
+        })
+        loaded = job_persistence.load_job_state("job1")
+        by_id = {g["gateId"]: g for g in loaded["critique"]["candidates"][0]["gateResults"]}
+        self.assertEqual(by_id["strategic_fit"]["outcome"], "borderline_pass")
+
+    def test_successful_recommendation_migrates_to_canonical_shape(self):
+        self._write_v1("job1", {
+            "meta": {"status": "done"},
+            "recommendation_and_map": {
+                "outcome": "success",
+                "recommendation": {"candidateId": "c1", "whyItWins": "x", "missingEvidence": ["needs a customer study"]},
+                "narrativeMap": {"unresolvedQuestions": ["Should we reposition?"], "createdAt": "2026-01-01T00:00:00Z"},
+            },
+        })
+        loaded = job_persistence.load_job_state("job1")
+        rec = loaded["recommendation_and_map"]["recommendation"]
+        self.assertEqual(rec["outcome"], "success")
+        self.assertEqual(rec["selectedCandidateId"], "c1")
+        self.assertIsNone(rec["failureReason"])
+        self.assertEqual(rec["missingEvidence"], ["needs a customer study"])
+        self.assertEqual(rec["leadershipDecisions"], ["Should we reposition?"])
+        self.assertEqual(rec["detail"]["whyItWins"], "x")
+        self.assertNotIn("candidateId", rec["detail"])
+
+    def test_stage_failed_recommendation_migrates_with_failure_reason_from_last_attempt(self):
+        self._write_v1("job1", {
+            "meta": {"status": "failed", "error": "recommendation_and_map_stage_failed: bad narrativeMap"},
+            "recommendation_and_map": {
+                "outcome": "stage_failed",
+                "attempts": [
+                    {"outcome": "failed", "validationFailure": "attempt 1 failed"},
+                    {"outcome": "failed", "validationFailure": 'recommendation_and_map response field "narrativeMap" must be dict, got str'},
+                ],
+            },
+        })
+        loaded = job_persistence.load_job_state("job1")
+        rec = loaded["recommendation_and_map"]["recommendation"]
+        self.assertEqual(rec["outcome"], "stage_failed")
+        self.assertIsNone(rec["selectedCandidateId"])
+        self.assertIn("narrativeMap", rec["failureReason"])
+        self.assertIsNone(rec["detail"])
+
+    def test_terminal_job_with_all_rejected_and_no_recommendation_section_synthesizes_no_candidate_passed(self):
+        """v1 never called persist_cb for recommendation_and_map on a genuine
+        no_candidate_passed outcome — the exact ambiguity this schema exists to fix.
+        A terminal (done/failed) job whose critique succeeded with zero viable survivors
+        is unambiguously that case, reconstructed here purely from already-migrated data."""
+        self._write_v1("job1", {
+            "meta": {"status": "done"},
+            "critique": {"outcome": "success", "candidates": [
+                {"id": "c1", "status": "rejected", "scores": {"Strategic fit": 1, "Differentiation": 1, "Evidence strength": 1}},
+                {"id": "c2", "status": "rejected", "scores": {"Strategic fit": 1, "Differentiation": 1, "Evidence strength": 1}},
+                {"id": "c3", "status": "rejected", "scores": {"Strategic fit": 1, "Differentiation": 1, "Evidence strength": 1}},
+            ]},
+            # no "recommendation_and_map" key at all — exactly the v1 no_candidate_passed shape
+        })
+        loaded = job_persistence.load_job_state("job1")
+        self.assertIn("recommendation_and_map", loaded)
+        rec = loaded["recommendation_and_map"]["recommendation"]
+        self.assertEqual(rec["outcome"], "no_candidate_passed")
+        self.assertIsNone(rec["selectedCandidateId"])
+
+    def test_non_terminal_job_with_no_recommendation_section_is_left_alone(self):
+        """A job still running (critique succeeded, recommendation_and_map genuinely not
+        reached yet) must NOT have no_candidate_passed synthesized — that would be wrong
+        (the stage just hasn't run yet, distinct from having run and found nothing)."""
+        self._write_v1("job1", {
+            "meta": {"status": "running"},
+            "critique": {"outcome": "success", "candidates": [
+                {"id": "c1", "status": "rejected", "scores": {"Strategic fit": 1, "Differentiation": 1, "Evidence strength": 1}},
+            ]},
+        })
+        loaded = job_persistence.load_job_state("job1")
+        self.assertNotIn("recommendation_and_map", loaded)
+
+    def test_terminal_job_with_a_viable_survivor_and_no_recommendation_section_is_left_alone(self):
+        """Defensive: if there's a viable candidate but somehow no recommendation_and_map
+        section, this is NOT the no_candidate_passed shape — never fabricate an outcome
+        that isn't supported by the data."""
+        self._write_v1("job1", {
+            "meta": {"status": "done"},
+            "critique": {"outcome": "success", "candidates": [
+                {"id": "c1", "status": "candidate", "scores": {"Strategic fit": 4, "Differentiation": 4, "Evidence strength": 4}},
+            ]},
+        })
+        loaded = job_persistence.load_job_state("job1")
+        self.assertNotIn("recommendation_and_map", loaded)
+
+    def test_real_hps_stage_failed_fixture_migrates_to_viable_candidates_with_stage_failed_recommendation(self):
+        """The permanent regression fixture: job 3c82acbfff4c4c5f9f3b5f6f9a3857a9's real
+        checkpoint from the 2026-07-31 HPS run, copied byte-for-byte (never read from or
+        written back to the real backend/job_state/ directory — this test only ever
+        touches its own isolated temp root)."""
+        real_fixture_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "job_state", "3c82acbfff4c4c5f9f3b5f6f9a3857a9", "checkpoint.json",
+        )
+        if not os.path.exists(real_fixture_path):
+            self.skipTest("real HPS fixture checkpoint not present on this machine")
+        with open(real_fixture_path) as f:
+            real_checkpoint = json.load(f)
+        self.assertEqual(real_checkpoint["schemaVersion"], 1, "fixture is expected to still be a v1 checkpoint on disk")
+
+        job_dir = os.path.join(self._tmp_root, "hps_fixture")
+        os.makedirs(job_dir)
+        with open(os.path.join(job_dir, job_persistence.CHECKPOINT_FILENAME), "w") as f:
+            json.dump(real_checkpoint, f)
+
+        loaded = job_persistence.load_job_state("hps_fixture")
+        self.assertEqual(loaded["schemaVersion"], 2)
+
+        candidates = loaded["critique"]["candidates"]
+        self.assertEqual(len(candidates), 3)
+        statuses = {c["status"] for c in candidates}
+        self.assertEqual(statuses, {"viable", "rejected"})
+        self.assertTrue(any(c["status"] == "viable" for c in candidates))
+
+        rec = loaded["recommendation_and_map"]["recommendation"]
+        self.assertEqual(rec["outcome"], "stage_failed")
+        self.assertIsNone(rec["selectedCandidateId"])
+        self.assertIn("missingEvidence", rec["failureReason"])
+
+        # The real file on disk is untouched by this read.
+        with open(real_fixture_path) as f:
+            still_v1 = json.load(f)
+        self.assertEqual(still_v1["schemaVersion"], 1)
+
+
 class DeleteAndCleanup(JobPersistenceTestCase):
     def test_delete_removes_the_job_directory(self):
         job_persistence.save_job_state("job1", {"x": 1})

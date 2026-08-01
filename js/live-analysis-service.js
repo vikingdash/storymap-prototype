@@ -11,6 +11,7 @@
 // none of it (job id, in-flight dataset, backend availability) applies to Wix/HPS or
 // needs to persist across a reload the way workflow progress does.
 import { buildEvidenceIndex } from "./evidence.js";
+import { normalizeCandidates, normalizeRecommendation } from "./candidate-state.js";
 
 // Derived from the browser's own address rather than hardcoded, so the same build works
 // unmodified whether the page was opened as localhost, 127.0.0.1, or a LAN IP (e.g. a
@@ -378,13 +379,17 @@ export const liveAnalysisService = {
   },
   async getCandidates() {
     assertDatasetReady();
-    return currentDataset.candidates;
+    return normalizeCandidates(currentDataset.candidates);
   },
   async getRecommendation() {
     assertDatasetReady();
-    if (!currentDataset.recommendation) return null;
-    const candidate = currentDataset.candidates.find((c) => c.id === currentDataset.recommendation.candidateId);
-    return { ...currentDataset.recommendation, candidate };
+    // currentDataset.recommendation is already the canonical
+    // {outcome, selectedCandidateId, failureReason, missingEvidence, leadershipDecisions,
+    // createdAt, detail} object once critique has succeeded (backend/pipeline_runner.py's
+    // build_recommendation_state) — null only when recommendation_and_map hasn't been
+    // reached at all (an earlier stage failed). normalizeRecommendation is a no-op in
+    // that already-canonical case; it only does real work for legacy/Wix-HPS shapes.
+    return normalizeRecommendation(currentDataset.recommendation, normalizeCandidates(currentDataset.candidates));
   },
   async getNarrativeMap() {
     assertDatasetReady();

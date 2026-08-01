@@ -18,6 +18,7 @@ import { HPS_DATASET } from "./cases/hps-case-data.js";
 import { NO_DIRECT_EVIDENCE_CONFIDENCE } from "./case-utils.js";
 import { buildEvidenceIndex } from "./evidence.js";
 import { liveAnalysisService } from "./live-analysis-service.js";
+import { normalizeCandidates, normalizeRecommendation } from "./candidate-state.js";
 
 function resolveAfter(value, ms = 120) {
   return new Promise((resolve) => setTimeout(() => resolve(value), ms));
@@ -220,12 +221,15 @@ function createAnalysisService(dataset) {
     },
     async getCandidates() {
       const ds = runPipeline();
-      return resolveAfter(ds.candidates);
+      return resolveAfter(normalizeCandidates(ds.candidates));
     },
     async getRecommendation() {
       const ds = runPipeline();
-      const recommended = ds.candidates.find((c) => c.id === ds.recommendation.candidateId);
-      return resolveAfter({ ...ds.recommendation, candidate: recommended });
+      // decisionAgent (above) already validated ds.recommendation/ds.candidates against
+      // the RAW seed vocabulary before this ever runs — normalizeRecommendation only
+      // reshapes an already-validated object into the canonical shape every screen reads,
+      // never re-validates it.
+      return resolveAfter(normalizeRecommendation(ds.recommendation, normalizeCandidates(ds.candidates)));
     },
     async getNarrativeMap() {
       const ds = runPipeline();

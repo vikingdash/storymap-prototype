@@ -57,45 +57,45 @@ from pipeline_runner import (
 class CandidateScoreBuilder(unittest.TestCase):
     def test_never_includes_customer_relevance(self):
         gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
-        scores, status = build_candidate_scores_and_status(gate)
+        scores, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
         self.assertNotIn("Customer relevance", scores)
 
     def test_never_includes_durability(self):
         gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
-        scores, status = build_candidate_scores_and_status(gate)
+        scores, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
         self.assertNotIn("Durability", scores)
 
     def test_only_expected_score_keys(self):
         gate = {"strategicFitGate": "weak", "differentiationGate": "weak", "evidenceSupportGate": "partial"}
-        scores, status = build_candidate_scores_and_status(gate)
+        scores, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
         self.assertEqual(set(scores.keys()), {"Strategic fit", "Differentiation", "Evidence strength"})
 
     def test_all_meets_passes(self):
         gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
-        scores, status = build_candidate_scores_and_status(gate)
-        self.assertEqual(status, "candidate")
+        scores, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
+        self.assertEqual(status, "viable")
         self.assertEqual(scores["Strategic fit"], GATE_TO_SCORE["meets"])
 
     def test_weak_alone_still_passes(self):
         """'weak'/'partial' are the middle tier, not failures — matches the earlier test
         run's observed behavior (3 real candidates, 0 rejected, several with 'weak')."""
         gate = {"strategicFitGate": "weak", "differentiationGate": "meets", "evidenceSupportGate": "partial"}
-        scores, status = build_candidate_scores_and_status(gate)
-        self.assertEqual(status, "candidate")
+        scores, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
+        self.assertEqual(status, "viable")
 
     def test_strategic_fit_fails_rejects(self):
         gate = {"strategicFitGate": "fails", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
-        _, status = build_candidate_scores_and_status(gate)
+        _, status, _, _ = build_candidate_scores_and_status(gate)
         self.assertEqual(status, "rejected")
 
     def test_differentiation_fails_rejects(self):
         gate = {"strategicFitGate": "meets", "differentiationGate": "fails", "evidenceSupportGate": "supported"}
-        _, status = build_candidate_scores_and_status(gate)
+        _, status, _, _ = build_candidate_scores_and_status(gate)
         self.assertEqual(status, "rejected")
 
     def test_unsupported_evidence_rejects(self):
         gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "unsupported"}
-        _, status = build_candidate_scores_and_status(gate)
+        _, status, _, _ = build_candidate_scores_and_status(gate)
         self.assertEqual(status, "rejected")
 
     def test_weak_score_sits_at_pass_threshold(self):
@@ -108,6 +108,49 @@ class CandidateScoreBuilder(unittest.TestCase):
     def test_fails_score_sits_below_pass_threshold(self):
         self.assertLess(GATE_TO_SCORE["fails"], 3)
         self.assertLess(GATE_TO_SCORE["unsupported"], 3)
+
+    def test_gate_results_has_one_entry_per_gate_with_traceable_fields(self):
+        """Governing spec Phase 1, decision 3: machine-readable outcome, visible
+        explanation, traceability to the gate — no parsing of prose required."""
+        gate = {"strategicFitGate": "meets", "differentiationGate": "weak", "evidenceSupportGate": "unsupported"}
+        _, _, gate_results, _ = build_candidate_scores_and_status(gate)
+        self.assertEqual(len(gate_results), 3)
+        by_id = {g["gateId"]: g for g in gate_results}
+        self.assertEqual(by_id["strategicFitGate"]["outcome"], "pass")
+        self.assertEqual(by_id["differentiationGate"]["outcome"], "borderline_pass")
+        self.assertEqual(by_id["evidenceSupportGate"]["outcome"], "fail")
+        for g in gate_results:
+            self.assertIn("criterion", g)
+            self.assertIn("score", g)
+            self.assertIn("threshold", g)
+            self.assertIn("margin", g)
+            self.assertIn("explanation", g)
+            self.assertIn("evaluatedAtStage", g)
+
+    def test_borderline_margin_stays_visible_not_collapsed_into_plain_pass(self):
+        """decision 3's explicit requirement: 'borderline margins remain visible for later
+        human review' — weak/partial must never look identical to meets/supported."""
+        gate = {"strategicFitGate": "weak", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
+        _, _, gate_results, _ = build_candidate_scores_and_status(gate)
+        outcomes = {g["gateId"]: g["outcome"] for g in gate_results}
+        self.assertEqual(outcomes["strategicFitGate"], "borderline_pass")
+        self.assertEqual(outcomes["differentiationGate"], "pass")
+        self.assertEqual(outcomes["evidenceSupportGate"], "pass")
+
+    def test_rejection_reasons_only_present_when_rejected_and_trace_to_failing_gates(self):
+        gate = {"strategicFitGate": "fails", "differentiationGate": "meets", "evidenceSupportGate": "unsupported"}
+        _, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
+        self.assertEqual(status, "rejected")
+        self.assertEqual({r["gateId"] for r in rejection_reasons}, {"strategicFitGate", "evidenceSupportGate"})
+        for r in rejection_reasons:
+            self.assertIn("code", r)
+            self.assertIn("explanation", r)
+
+    def test_no_rejection_reasons_when_viable(self):
+        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
+        _, status, _, rejection_reasons = build_candidate_scores_and_status(gate)
+        self.assertEqual(status, "viable")
+        self.assertEqual(rejection_reasons, [])
 
 
 EVIDENCE_ITEM = lambda id_, source_id, excerpt: {  # noqa: E731
@@ -492,10 +535,18 @@ class MalformedRecordHandling(unittest.TestCase):
 
         As of the 2026-07-31 hardening, the whole run must NOT collapse to dataset=None —
         strategicFoundation/diagnosis/candidates/evidence already succeeded and must
-        survive intact; only recommendation/narrativeMap/audiences are empty. The failure
-        is reported as diagnostics.outcome == "partial_failure" with the exact failed
-        stage and reason, and the traceback must be captured but never exposed in
-        `diagnostics` (which the frontend receives verbatim)."""
+        survive intact; only narrativeMap/audiences are empty. The failure is reported as
+        diagnostics.outcome == "partial_failure" with the exact failed stage and reason,
+        and the traceback must be captured but never exposed in `diagnostics` (which the
+        frontend receives verbatim).
+
+        As of the governing spec Phase 1 canonical-state work, dataset["recommendation"]
+        is no longer None here — that was the exact ambiguity (indistinguishable from
+        no_candidate_passed) this schema exists to eliminate. It is now always a
+        structured object once critique has succeeded, with outcome "stage_failed" and
+        every earlier candidate's status/gateResults preserved exactly as critique left
+        them (this IS the real HPS permanent regression fixture's shape, reproduced here
+        with mocked data)."""
         self.recommend_result["narrativeMap"] = "this is a malformed narrativeMap, not an object"
         result = self._run()  # must not raise
         dataset = result["dataset"]
@@ -506,8 +557,26 @@ class MalformedRecordHandling(unittest.TestCase):
         self.assertEqual(len(dataset["diagnosis"]), 1)
         self.assertEqual(len(dataset["candidates"]), 3)
         self.assertTrue(dataset["evidence"])
-        self.assertIsNone(dataset["recommendation"])
         self.assertIsNone(dataset["narrativeMap"])
+
+        # The canonical recommendation object — never None once critique succeeded, and
+        # distinguishable from no_candidate_passed purely by its own `outcome` field.
+        rec = dataset["recommendation"]
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["outcome"], "stage_failed")
+        self.assertIsNone(rec["selectedCandidateId"])
+        self.assertIn("narrativeMap", rec["failureReason"])
+        self.assertEqual(rec["missingEvidence"], [])
+        self.assertIsNone(rec["detail"])
+
+        # Every candidate's critique-stage status/gateResults/rejectionReasons survive
+        # untouched — "stage_failed preserves all earlier candidate statuses" by
+        # construction, since process_recommend_and_map_response never runs on a failure.
+        for cand in dataset["candidates"]:
+            self.assertIn(cand["status"], ("viable", "rejected"))
+            self.assertIn("gateResults", cand)
+            self.assertIn("rejectionReasons", cand)
+        self.assertTrue(any(c["status"] == "viable" for c in dataset["candidates"]), "at least one candidate must remain viable — this is a stage failure, not no_candidate_passed")
 
         self.assertEqual(diag["outcome"], "stage_failed")
         self.assertEqual(diag["failed_stage"], "recommendation_and_map")
@@ -555,7 +624,7 @@ class RetryRecommendationStage(unittest.TestCase):
         self.evidence_pool = {"ev1": {"id": "ev1", "sourceId": "src1", "excerpt": "x", "paraphrase": "p", "strength": "moderate", "verified": True}}
         self.foundation_summary = [{"id": "sf1", "type": "customer", "statement": "x", "statementType": "source_fact"}]
 
-    def _candidates(self, statuses=("candidate", "candidate", "candidate")):
+    def _candidates(self, statuses=("viable", "viable", "viable")):
         cands = _valid_candidates()
         for c, status in zip(cands, statuses):
             c["status"] = status
@@ -565,7 +634,9 @@ class RetryRecommendationStage(unittest.TestCase):
         mock_recommend = patch("anthropic_pipeline.recommend_and_map").start()
         candidates = self._candidates(statuses=("rejected", "rejected", "rejected"))
         result = retry_recommendation_and_map(candidates, self.evidence_pool, self.foundation_summary)
-        self.assertIsNone(result["recommendation"])
+        self.assertIsNotNone(result["recommendation"])
+        self.assertEqual(result["recommendation"]["outcome"], "no_candidate_passed")
+        self.assertIsNone(result["recommendation"]["selectedCandidateId"])
         self.assertIsNone(result["narrativeMap"])
         self.assertEqual(result["diagnostics"]["outcome"], "no_candidate_passed")
         mock_recommend.assert_not_called()
@@ -577,7 +648,9 @@ class RetryRecommendationStage(unittest.TestCase):
         self.assertIsNotNone(result["recommendation"])
         self.assertIsNotNone(result["narrativeMap"])
         self.assertEqual(result["diagnostics"]["outcome"], "success")
-        self.assertEqual(result["recommendation"]["candidateId"], "cand1")
+        self.assertEqual(result["recommendation"]["outcome"], "success")
+        self.assertEqual(result["recommendation"]["selectedCandidateId"], "cand1")
+        self.assertEqual(result["recommendation"]["detail"]["candidateId"], "cand1")
 
     def test_retry_does_not_refetch_sources(self):
         mock_fetch = patch("pipeline_runner.fetch_all_sources").start()
@@ -602,10 +675,26 @@ class RetryRecommendationStage(unittest.TestCase):
         bad_result["narrativeMap"] = "malformed, not an object"
         patch("anthropic_pipeline.recommend_and_map", return_value=bad_result).start()
         result = retry_recommendation_and_map(self._candidates(), self.evidence_pool, self.foundation_summary)
-        self.assertIsNone(result["recommendation"])
+        self.assertIsNotNone(result["recommendation"])
+        self.assertEqual(result["recommendation"]["outcome"], "stage_failed")
+        self.assertIsNone(result["recommendation"]["selectedCandidateId"])
+        self.assertIn("narrativeMap", result["recommendation"]["failureReason"])
         self.assertIsNone(result["narrativeMap"])
         self.assertEqual(result["diagnostics"]["outcome"], "stage_failed")
         self.assertIn("narrativeMap", result["diagnostics"]["failure_reason"])
+
+    def test_retry_rejects_a_hallucinated_candidate_id(self):
+        """recommendedCandidateId must reference one of the candidates that actually
+        survived critique — governing spec Phase 1: "success requires a valid
+        selectedCandidateId referencing a viable candidate." A model hallucinating an id
+        is a validation failure (retried), never silently accepted."""
+        bad_result = dict(_VALID_RECOMMEND_AND_MAP)
+        bad_result["recommendedCandidateId"] = "cand_does_not_exist"
+        patch("anthropic_pipeline.recommend_and_map", return_value=bad_result).start()
+        result = retry_recommendation_and_map(self._candidates(), self.evidence_pool, self.foundation_summary)
+        self.assertEqual(result["diagnostics"]["outcome"], "stage_failed")
+        self.assertEqual(result["recommendation"]["outcome"], "stage_failed")
+        self.assertIn("cand_does_not_exist", result["recommendation"]["failureReason"])
         self.assertIsNotNone(result["debug_traceback"])
 
 
@@ -1255,14 +1344,21 @@ class RunPipelineFromSourcesRefactorRegression(unittest.TestCase):
 
     def _strip_volatile_fields(self, dataset):
         """narrativeMap.createdAt (datetime.now(timezone.utc), set inside
-        process_recommend_and_map_response) is the ONLY thing legitimately expected to
-        differ between two separately-executed runs of identical inputs — everything
-        else, including narrativeMap's id (a deterministic constant, "map_live_v1" for
-        both paths here since both call sites use the same map_id argument), must be
+        process_recommend_and_map_response), recommendation.createdAt (now_iso(), set
+        inside build_recommendation_state), and each candidate's statusUpdatedAt (now_iso(),
+        set inside process_critique_response) are the only things legitimately expected to
+        differ between two separately-executed runs of identical inputs — everything else,
+        including narrativeMap's id (a deterministic constant, "map_live_v1" for both
+        paths here since both call sites use the same map_id argument), must be
         byte-identical."""
         stripped = json.loads(json.dumps(dataset, default=str))
         if stripped.get("narrativeMap"):
             stripped["narrativeMap"]["createdAt"] = "<normalized>"
+        if stripped.get("recommendation"):
+            stripped["recommendation"]["createdAt"] = "<normalized>"
+        for cand in stripped.get("candidates") or []:
+            if "statusUpdatedAt" in cand:
+                cand["statusUpdatedAt"] = "<normalized>"
         return stripped
 
     def test_run_pipeline_from_sources_matches_run_analysis_for_identical_inputs(self):

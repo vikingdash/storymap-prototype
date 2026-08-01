@@ -691,7 +691,7 @@ class RegenerateInPlace(unittest.TestCase):
             strategic_foundation={"outcome": "success", "strategicFoundation": [_ORIGINAL_FOUNDATION_ITEM], "evidencePool": {}, "attempts": []},
             diagnosis={"outcome": "success", "diagnosis": [{"id": "d1", "title": "old finding"}], "competitorContrasts": [], "evidencePool": {}},
             narrative_choices={"outcome": "success", "candidates": [{"id": "cand1", "name": "old candidate"}]},
-            critique={"outcome": "success", "candidates": [{"id": "cand1", "name": "old candidate", "status": "candidate"}]},
+            critique={"outcome": "success", "candidates": [{"id": "cand1", "name": "old candidate", "status": "viable"}]},
             recommendation_and_map={"outcome": "success", "recommendation": {"candidateId": "cand1", "recommendedDecision": "old decision"}, "narrativeMap": {"id": "old_map"}, "audiences": []},
         )
 
@@ -1075,6 +1075,194 @@ class StageProgressReporting(unittest.TestCase):
         body = resp.get_json()
         self.assertIn("stageProgress", body)
         self.assertEqual(body["usage"]["totals"], {"input_tokens": 100, "output_tokens": 50})
+
+
+def _gate(candidate_id, strategic="meets", differentiation="meets", evidence="supported"):
+    return {"candidateId": candidate_id, "findings": ["ok"], "strategicFitGate": strategic,
+            "differentiationGate": differentiation, "evidenceSupportGate": evidence}
+
+
+def _candidate(i):
+    return {"id": f"cand{i}", "name": f"Candidate {i}", "oneSentenceStory": "x",
+            "sevenParts": {k: "x" for k in ["context", "tension", "belief", "role", "value", "proof", "direction"]},
+            "strategicLogic": ["x"], "customerRelevance": "x", "differentiation": "x",
+            "tradeoffs": ["x"], "risks": ["x"], "claims": []}
+
+
+_VALID_NARRATIVE_MAP = {
+    "coreNarrative": "x",
+    "sevenParts": {k: "x" for k in ["context", "tension", "belief", "role", "value", "proof", "direction"]},
+    "coreClaims": [], "likelyObjections": [], "weakOrUnsupportedClaims": [], "unresolvedQuestions": ["Should we reposition?"],
+}
+
+
+class RecommendationOutcomeContract(unittest.TestCase):
+    """Pipeline-contract tests for the governing spec Phase 1 canonical recommendation
+    state: runs the REAL run_analysis()/run_pipeline_from_sources() end to end through
+    the actual /api/analyze-company job queue (only the Anthropic SDK calls are mocked —
+    everything from jobs.py through pipeline_runner.py's real stage-processing functions
+    executes for real), then asserts the exact JSON a browser's /status poll would
+    receive. This is what proves stage_failed and no_candidate_passed are structurally
+    distinguishable end to end, not just at the unit level."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        self._patchers = []
+        self._patch("anthropic_pipeline.get_client", return_value=object())
+        self._patch("pipeline_runner.fetch_all_sources", return_value=(
+            [{"id": "src_live_company", "companyId": "live", "title": "Co", "publisher": "co.com",
+              "sourceType": "website", "url": "https://co.com", "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved"}],
+            {"src_live_company": "The company serves manufacturing customers."},
+            [],
+            {"id": "src_live_company", "title": "Co", "publisher": "co.com"},
+        ))
+        self._patch("anthropic_pipeline.extract_foundation", side_effect=lambda *a, **k: {
+            "evidence": [{"id": "ev1", "sourceId": "src_live_company", "excerpt": "The company serves manufacturing customers.",
+                          "paraphrase": "p", "evidenceType": "statement", "strength": "moderate", "freshness": "current"}],
+            "strategicFoundation": [{"id": "sf1", "type": "customer", "statement": "Serves manufacturing customers.",
+                                     "statementType": "source_fact", "evidence": [{"evidenceId": "ev1", "relevance": "direct", "rationale": "r"}]}],
+        })
+        self._patch("anthropic_pipeline.diagnose", side_effect=lambda *a, **k: {
+            "evidence": [], "diagnosis": [{"id": "d1", "title": "t", "explanation": "The company serves manufacturing customers.",
+                                           "significance": "medium", "statementType": "source_fact", "evidence": [{"evidenceId": "ev1", "relevance": "direct", "rationale": "r"}]}],
+            "competitorOverlapAssessed": False, "competitorOverlapNote": "", "competitorContrasts": [],
+        })
+        self._patch("anthropic_pipeline.generate_candidates", side_effect=lambda *a, **k: {
+            "candidates": [_candidate(1), _candidate(2), _candidate(3)],
+        })
+
+    def tearDown(self):
+        jobs._QUEUE.join()
+        for p in self._patchers:
+            p.stop()
+
+    def _patch(self, target, **kwargs):
+        p = patch(target, **kwargs)
+        mock = p.start()
+        self._patchers.append(p)
+        return mock
+
+    def _run_and_poll(self):
+        resp = self.client.post("/api/analyze-company", json={"companyUrl": "https://co.com"})
+        job_id = resp.get_json()["jobId"]
+        return job_id, _poll_until_terminal(self.client, job_id)
+
+    def test_stage_failed_at_final_stage_preserves_viable_candidates_and_is_distinct_from_no_candidate_passed(self):
+        self._patch("anthropic_pipeline.critique_candidates", side_effect=lambda *a, **k: {
+            "critiques": [_gate("cand1"), _gate("cand2"), _gate("cand3", strategic="fails")],
+        })
+        # The exact real 2026-07-31 HPS failure shape: narrativeMap returned as a string.
+        self._patch("anthropic_pipeline.recommend_and_map", side_effect=lambda *a, **k: {
+            "recommendedCandidateId": "cand1", "recommendedDecision": "x", "whyItWins": "x",
+            "whyCustomersCare": "x", "whyCredible": "x", "howDifferent": "x", "missingEvidence": [],
+            "tradeoffs": [], "leadershipDecisionsRequired": [], "whyOthersNotSelected": {}, "audiences": [],
+            "narrativeMap": "this is a malformed narrativeMap, not an object",
+        })
+
+        job_id, final = self._run_and_poll()
+        self.assertEqual(final["status"], "failed")
+        self.assertIsNotNone(final["dataset"], "partial results must survive a final-stage failure")
+
+        rec = final["dataset"]["recommendation"]
+        self.assertIsNotNone(rec, "recommendation must never be null once critique has succeeded — this is the exact ambiguity being fixed")
+        self.assertEqual(rec["outcome"], "stage_failed")
+        self.assertIsNone(rec["selectedCandidateId"])
+        self.assertIn("narrativeMap", rec["failureReason"])
+        self.assertIsNone(final["dataset"]["narrativeMap"])
+
+        candidates = final["dataset"]["candidates"]
+        self.assertEqual(len(candidates), 3)
+        statuses = {c["status"] for c in candidates}
+        self.assertEqual(statuses, {"viable", "rejected"})
+        self.assertTrue(any(c["status"] == "viable" for c in candidates))
+        for c in candidates:
+            self.assertIn("gateResults", c)
+            self.assertIn("rejectionReasons", c)
+
+        self.assertEqual(final["stageProgress"]["recommendation_and_map"]["outcome"], "stage_failed")
+
+    def test_no_candidate_passed_when_all_candidates_fail_critique(self):
+        self._patch("anthropic_pipeline.critique_candidates", side_effect=lambda *a, **k: {
+            "critiques": [_gate("cand1", strategic="fails"), _gate("cand2", strategic="fails"), _gate("cand3", strategic="fails")],
+        })
+        mock_recommend = self._patch("anthropic_pipeline.recommend_and_map")
+
+        job_id, final = self._run_and_poll()
+        self.assertEqual(final["status"], "done", "no_candidate_passed is a valid terminal state, not an error")
+        self.assertIsNotNone(final["dataset"])
+
+        rec = final["dataset"]["recommendation"]
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["outcome"], "no_candidate_passed")
+        self.assertIsNone(rec["selectedCandidateId"])
+
+        candidates = final["dataset"]["candidates"]
+        self.assertEqual(len(candidates), 3)
+        self.assertTrue(all(c["status"] == "rejected" for c in candidates))
+
+        self.assertEqual(final["stageProgress"]["recommendation_and_map"]["outcome"], "no_candidate_passed")
+        mock_recommend.assert_not_called()
+
+    def test_successful_recommendation_carries_selected_candidate_id_and_leadership_decisions(self):
+        self._patch("anthropic_pipeline.critique_candidates", side_effect=lambda *a, **k: {
+            "critiques": [_gate("cand1"), _gate("cand2"), _gate("cand3", strategic="fails")],
+        })
+        self._patch("anthropic_pipeline.recommend_and_map", side_effect=lambda *a, **k: {
+            "recommendedCandidateId": "cand1", "recommendedDecision": "x", "whyItWins": "x",
+            "whyCustomersCare": "x", "whyCredible": "x", "howDifferent": "x", "missingEvidence": ["needs a customer study"],
+            "tradeoffs": [], "leadershipDecisionsRequired": [], "whyOthersNotSelected": {}, "audiences": [],
+            "narrativeMap": _VALID_NARRATIVE_MAP,
+        })
+
+        job_id, final = self._run_and_poll()
+        self.assertEqual(final["status"], "done")
+        rec = final["dataset"]["recommendation"]
+        self.assertEqual(rec["outcome"], "success")
+        self.assertEqual(rec["selectedCandidateId"], "cand1")
+        self.assertEqual(rec["missingEvidence"], ["needs a customer study"])
+        self.assertEqual(rec["leadershipDecisions"], ["Should we reposition?"])
+        self.assertIsNotNone(rec["detail"])
+
+        # The selected candidate remains structurally "viable" — never a fourth status
+        # value like "recommended" or "selected" (decision 1).
+        candidates = {c["id"]: c for c in final["dataset"]["candidates"]}
+        self.assertEqual(candidates["cand1"]["status"], "viable")
+        self.assertEqual(candidates["cand2"]["status"], "viable")
+        self.assertEqual(candidates["cand3"]["status"], "rejected")
+
+    def test_stage_failed_and_no_candidate_passed_are_never_indistinguishable(self):
+        """The exact real bug this whole schema exists to fix, asserted directly: two
+        genuinely different backend outcomes must never collapse to the same observable
+        /status shape."""
+        self._patch("anthropic_pipeline.critique_candidates", side_effect=lambda *a, **k: {
+            "critiques": [_gate("cand1"), _gate("cand2"), _gate("cand3", strategic="fails")],
+        })
+        self._patch("anthropic_pipeline.recommend_and_map", side_effect=lambda *a, **k: {
+            "recommendedCandidateId": "cand1", "recommendedDecision": "x", "whyItWins": "x",
+            "whyCustomersCare": "x", "whyCredible": "x", "howDifferent": "x", "missingEvidence": [],
+            "tradeoffs": [], "leadershipDecisionsRequired": [], "whyOthersNotSelected": {}, "audiences": [],
+            "narrativeMap": "malformed",
+        })
+        _, stage_failed_final = self._run_and_poll()
+
+        for p in reversed(self._patchers[5:]):  # keep the 5 setUp patches (get_client/fetch/foundation/diagnosis/candidates), stop the rest LIFO
+            p.stop()
+        self._patchers = self._patchers[:5]
+        self._patch("anthropic_pipeline.critique_candidates", side_effect=lambda *a, **k: {
+            "critiques": [_gate("cand1", strategic="fails"), _gate("cand2", strategic="fails"), _gate("cand3", strategic="fails")],
+        })
+        self._patch("anthropic_pipeline.recommend_and_map")
+        _, no_candidate_final = self._run_and_poll()
+
+        self.assertNotEqual(stage_failed_final["status"], no_candidate_final["status"])
+        self.assertNotEqual(
+            stage_failed_final["dataset"]["recommendation"]["outcome"],
+            no_candidate_final["dataset"]["recommendation"]["outcome"],
+        )
+        self.assertNotEqual(
+            stage_failed_final["stageProgress"]["recommendation_and_map"]["outcome"],
+            no_candidate_final["stageProgress"]["recommendation_and_map"]["outcome"],
+        )
 
 
 class UsageAccumulation(unittest.TestCase):

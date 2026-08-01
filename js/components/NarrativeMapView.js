@@ -20,26 +20,46 @@ const PARTS = [
 
 export async function renderNarrativeMapView(container, { service, state, drawer, onNavigate }) {
   container.innerHTML = `<div class="loading">Structuring the Narrative Map…</div>`;
-  const [map, audiences, competitorContrasts, evidenceIndex] = await Promise.all([
+  const [map, audiences, competitorContrasts, evidenceIndex, recommendation] = await Promise.all([
     service.getNarrativeMap(),
     service.getAudiences(),
     service.getCompetitorContrasts(),
     service.getEvidenceIndex(),
+    service.getRecommendation(),
   ]);
 
-  // Only reachable in the live flow when no candidate passed review — see Recommendation.js's
-  // matching guard. Seeded cases always have a map; this never fires for Wix/HPS.
+  // Only reachable in the live flow — seeded Wix/HPS cases always have a map (their
+  // recommendation is always synthesized as "success"; see candidate-state.js's
+  // normalizeRecommendation), so this never fires for them. Two genuinely different
+  // situations share the absence of a map, and per the governing spec Phase 1 must NOT
+  // share the same screen or wording — see Recommendation.js's matching split.
   if (!map) {
-    container.innerHTML = `
-      <section class="screen-header">
-        <div class="eyebrow">5 · Narrative Map</div>
-        <h1>No Narrative Map yet</h1>
-        <p class="lead">StoryMap didn't recommend a direction, so there's no approved narrative to map. See the Recommendation screen for what evidence is missing.</p>
-      </section>
-      <div class="screen-footer">
-        <button class="primary-button" type="button" data-action="back">← Back to Recommendation</button>
-      </div>
-    `;
+    if (recommendation && recommendation.outcome === "stage_failed") {
+      container.innerHTML = `
+        <section class="screen-header">
+          <div class="eyebrow">5 · Narrative Map</div>
+          <h1>The final recommendation needs another attempt</h1>
+          <p class="lead">The earlier analysis and viable directions are preserved. Retry this step to complete the recommendation and Narrative Map.</p>
+        </section>
+        <div class="screen-footer">
+          <button class="primary-button" type="button" data-action="back">← Back to Recommendation</button>
+        </div>
+      `;
+    } else {
+      // no_candidate_passed (or, defensively, recommendation not reached at all) —
+      // distinct wording, never StoryMap saying "try again," StoryMap saying no
+      // direction cleared the bar.
+      container.innerHTML = `
+        <section class="screen-header">
+          <div class="eyebrow">5 · Narrative Map</div>
+          <h1>No Narrative Map yet</h1>
+          <p class="lead">StoryMap didn't recommend a direction, so there's no approved narrative to map. See the Recommendation screen for what evidence is missing.</p>
+        </section>
+        <div class="screen-footer">
+          <button class="primary-button" type="button" data-action="back">← Back to Recommendation</button>
+        </div>
+      `;
+    }
     container.querySelector('[data-action="back"]').addEventListener("click", () => onNavigate("recommendation"));
     return;
   }

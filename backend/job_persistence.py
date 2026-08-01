@@ -24,8 +24,9 @@ import re
 import shutil
 import tempfile
 import time
+from datetime import datetime, timezone
 
-JOB_STATE_SCHEMA_VERSION = 1
+JOB_STATE_SCHEMA_VERSION = 2
 # Overridable via env var (read once, at import time) so a real subprocess — e.g. a
 # process-restart integration test that spawns actual `python3 app.py` instances — can
 # point an isolated instance at a throwaway directory without ever touching the real
@@ -164,12 +165,181 @@ def save_job_state(job_id, state):
         raise
 
 
+# --- Schema migration (governing spec Phase 1) --------------------------------------------
+# v1 -> v2 introduces the canonical candidate status vocabulary (pending/viable/rejected,
+# replacing the overloaded "candidate"/"recommended") and the explicit
+# recommendation{outcome, selectedCandidateId, failureReason, missingEvidence,
+# leadershipDecisions, createdAt} object — see pipeline_runner.py's
+# build_recommendation_state/build_candidate_scores_and_status. Every v1 checkpoint on
+# disk (including the permanent HPS stage_failed and Schneider Electric success
+# regression fixtures) predates both.
+#
+# Migration is READ-TIME ONLY: load_job_state() returns the migrated dict in memory but
+# never writes it back itself — the original v1 file on disk is untouched until some
+# later, explicitly-requested action (a retry, a regenerate — anything that legitimately
+# calls save_job_state for this job_id again) saves the checkpoint, at which point it is
+# naturally persisted as v2 going forward. This is what satisfies "no automatic overwrite
+# of the original version-1 checkpoint" and "explicit controlled save only when later
+# requested" without needing a separate opt-in flag anywhere.
+def _iso_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# Kept self-contained (no import of pipeline_runner's constants) — this module has never
+# depended on pipeline_runner and a migration helper is not a good reason to start.
+_MIGRATION_CANDIDATE_STATUS_MAP_NARRATIVE_CHOICES = {"candidate": "pending"}
+_MIGRATION_CANDIDATE_STATUS_MAP_CRITIQUE = {"candidate": "viable", "recommended": "viable", "rejected": "rejected"}
+_MIGRATION_GATE_CRITERIA = ["Strategic fit", "Differentiation", "Evidence strength"]
+_MIGRATION_GATE_THRESHOLD = 3
+
+
+def _migrate_candidate_v1_to_v2(cand, evaluated_at_stage, status_map, migrated_at):
+    """Normalizes one candidate dict from its v1 shape. gateResults/rejectionReasons never
+    existed in v1, so they're reconstructed from the numeric scores that DID exist
+    (scores were already deterministically derived from the same categorical gates by
+    GATE_TO_SCORE — see pipeline_runner.py) — an honest reconstruction from the same
+    underlying facts, never a fabrication. Borderline scores (== threshold) are labeled
+    "borderline_pass", matching build_candidate_scores_and_status's live behavior, so
+    migrated and freshly-computed gateResults stay visibly consistent with each other."""
+    cand = dict(cand)
+    old_status = cand.get("status")
+    cand["status"] = status_map.get(old_status, old_status)
+    cand.setdefault("statusEvaluatedAtStage", evaluated_at_stage)
+    cand.setdefault("statusUpdatedAt", migrated_at)
+    if "gateResults" not in cand:
+        scores = cand.get("scores") or {}
+        gate_results = []
+        for criterion in _MIGRATION_GATE_CRITERIA:
+            if criterion not in scores:
+                continue
+            score = scores[criterion]
+            outcome = "pass" if score > _MIGRATION_GATE_THRESHOLD else ("borderline_pass" if score == _MIGRATION_GATE_THRESHOLD else "fail")
+            gate_results.append({
+                "gateId": criterion.lower().replace(" ", "_"),
+                "criterion": criterion,
+                "outcome": outcome,
+                "score": score,
+                "threshold": _MIGRATION_GATE_THRESHOLD,
+                "margin": score - _MIGRATION_GATE_THRESHOLD,
+                "explanation": f"Reconstructed from a schema-version-1 checkpoint's {criterion} score during migration.",
+                "evaluatedAtStage": evaluated_at_stage,
+            })
+        cand["gateResults"] = gate_results
+    if "rejectionReasons" not in cand:
+        rejection_reasons = []
+        if cand["status"] == "rejected":
+            failing = [gr for gr in cand["gateResults"] if gr["outcome"] == "fail"]
+            if failing:
+                rejection_reasons = [{"code": f'{gr["gateId"]}_failed', "gateId": gr["gateId"], "explanation": gr["explanation"]} for gr in failing]
+            else:
+                rejection_reasons = [{"code": "rejected_pre_migration", "gateId": None, "explanation": "This candidate was rejected before structured gate results were tracked (migrated from schema version 1)."}]
+        cand["rejectionReasons"] = rejection_reasons
+    return cand
+
+
+def _migrate_recommendation_section_v1_to_v2(rec_section, migrated_at):
+    rec_section = dict(rec_section)
+    if rec_section.get("outcome") == "success":
+        old_rec = rec_section.get("recommendation") or {}
+        narrative_map = rec_section.get("narrativeMap") or {}
+        rec_section["recommendation"] = {
+            "outcome": "success",
+            "selectedCandidateId": old_rec.get("candidateId"),
+            "failureReason": None,
+            "missingEvidence": old_rec.get("missingEvidence") or [],
+            "leadershipDecisions": narrative_map.get("unresolvedQuestions") or [],
+            "createdAt": narrative_map.get("createdAt") or migrated_at,
+            "detail": {k: v for k, v in old_rec.items() if k != "candidateId"} or None,
+        }
+    elif rec_section.get("outcome") == "stage_failed":
+        last_failure = None
+        for attempt in reversed(rec_section.get("attempts") or []):
+            if attempt.get("outcome") != "success":
+                last_failure = attempt.get("validationFailure")
+                break
+        rec_section["recommendation"] = {
+            "outcome": "stage_failed",
+            "selectedCandidateId": None,
+            "failureReason": last_failure,
+            "missingEvidence": [],
+            "leadershipDecisions": [],
+            "createdAt": migrated_at,
+            "detail": None,
+        }
+    return rec_section
+
+
+def _synthesized_no_candidate_passed_section(migrated_at):
+    return {
+        "outcome": "no_candidate_passed",
+        "attempts": [],
+        "recommendation": {
+            "outcome": "no_candidate_passed",
+            "selectedCandidateId": None,
+            "failureReason": None,
+            "missingEvidence": [],
+            "leadershipDecisions": [],
+            "createdAt": migrated_at,
+            "detail": None,
+        },
+    }
+
+
+def migrate_checkpoint_v1_to_v2(data):
+    """Pure function: takes a parsed v1 checkpoint dict, returns a new v2-shaped dict.
+    Never mutates its input, never touches disk. See this section's module-level comment
+    for the read-time-only write policy."""
+    migrated_at = _iso_now()
+    data = dict(data)
+
+    nc = data.get("narrative_choices")
+    if isinstance(nc, dict) and isinstance(nc.get("candidates"), list):
+        nc = dict(nc)
+        nc["candidates"] = [
+            _migrate_candidate_v1_to_v2(c, "narrative_choices", _MIGRATION_CANDIDATE_STATUS_MAP_NARRATIVE_CHOICES, migrated_at)
+            for c in nc["candidates"]
+        ]
+        data["narrative_choices"] = nc
+
+    crit = data.get("critique")
+    if isinstance(crit, dict) and isinstance(crit.get("candidates"), list):
+        crit = dict(crit)
+        crit["candidates"] = [
+            _migrate_candidate_v1_to_v2(c, "critique", _MIGRATION_CANDIDATE_STATUS_MAP_CRITIQUE, migrated_at)
+            for c in crit["candidates"]
+        ]
+        data["critique"] = crit
+
+    rec_section = data.get("recommendation_and_map")
+    meta = data.get("meta") or {}
+    job_terminal = meta.get("status") in ("done", "failed")
+
+    if isinstance(rec_section, dict) and rec_section.get("outcome") in ("success", "stage_failed"):
+        data["recommendation_and_map"] = _migrate_recommendation_section_v1_to_v2(rec_section, migrated_at)
+    elif rec_section is None and job_terminal and isinstance(crit, dict) and crit.get("outcome") == "success":
+        # v1 never called persist_cb for recommendation_and_map on a genuine
+        # no_candidate_passed outcome (the exact bug this schema exists to fix) — a
+        # terminal job whose critique succeeded with zero viable survivors is
+        # unambiguously that case, reconstructible purely from already-migrated data,
+        # never a guess.
+        migrated_candidates = crit["candidates"]
+        if migrated_candidates and all(c.get("status") == "rejected" for c in migrated_candidates):
+            data["recommendation_and_map"] = _synthesized_no_candidate_passed_section(migrated_at)
+
+    data["schemaVersion"] = JOB_STATE_SCHEMA_VERSION
+    data["schemaMigratedFrom"] = 1
+    data["schemaMigratedAt"] = migrated_at
+    return data
+
+
 def load_job_state(job_id):
     """Returns the checkpoint dict, or None if no checkpoint exists yet for this job.
     Raises CorruptedJobStateError if the file exists but isn't valid JSON (or is missing
-    schemaVersion), and IncompatibleJobStateError if it parses but carries a
-    schemaVersion this code doesn't recognize — a caller must never silently proceed with
-    a mismatched shape."""
+    schemaVersion), and IncompatibleJobStateError if it parses but carries a schemaVersion
+    this code has no migration path for — a caller must never silently proceed with a
+    mismatched shape. A v1 checkpoint is migrated to v2 in memory (see
+    migrate_checkpoint_v1_to_v2) and returned already-normalized; the file on disk is left
+    exactly as it was until something explicitly saves this job_id again."""
     path = _checkpoint_path(job_id)
     if not os.path.exists(path):
         return None
@@ -182,12 +352,15 @@ def load_job_state(job_id):
         raise CorruptedJobStateError(
             f"Job state file for {job_id!r} is missing a schemaVersion — malformed or from an incompatible source"
         )
-    if data["schemaVersion"] != JOB_STATE_SCHEMA_VERSION:
-        raise IncompatibleJobStateError(
-            f"Job state file for {job_id!r} has schemaVersion {data['schemaVersion']}, "
-            f"this code expects {JOB_STATE_SCHEMA_VERSION} — incompatible, cannot be loaded"
-        )
-    return data
+    version = data["schemaVersion"]
+    if version == JOB_STATE_SCHEMA_VERSION:
+        return data
+    if version == 1 and JOB_STATE_SCHEMA_VERSION == 2:
+        return migrate_checkpoint_v1_to_v2(data)
+    raise IncompatibleJobStateError(
+        f"Job state file for {job_id!r} has schemaVersion {version}, "
+        f"this code expects {JOB_STATE_SCHEMA_VERSION} and has no migration path from {version} — incompatible, cannot be loaded"
+    )
 
 
 def delete_job_state(job_id):

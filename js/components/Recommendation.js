@@ -2,7 +2,7 @@
 // objective truth: why it wins, why customers care, why it's credible, how it differs, what
 // leadership must still decide, what evidence is missing, and why the alternatives lost.
 import { escapeHtml } from "../labels.js";
-import { getSourceCoverage, expandSources, getSourceExpansionsUsed, getMaxSourceExpansions, getCurrentSourceUrls } from "../live-analysis-service.js";
+import { getSourceCoverage, expandSources, getSourceExpansionsUsed, getMaxSourceExpansions, getCurrentSourceUrls, retryStage } from "../live-analysis-service.js";
 
 // Human-readable labels for backend/pipeline_runner.py's SOURCE_COVERAGE_DIMENSIONS keys
 // — defined locally rather than imported, matching how EvidenceRoom.js already keeps its
@@ -24,7 +24,8 @@ const COVERAGE_DIMENSION_LABELS = {
 const MAX_SUPPORTING = 5;
 const MAX_COMPETITOR = 3;
 
-export async function renderRecommendation(container, { service, state, drawer, onNavigate }) {
+export async function renderRecommendation(container, options) {
+  const { service, state, onNavigate } = options;
   container.innerHTML = `<div class="loading">Assembling the recommendation…</div>`;
   const [recommendation, candidates, foundation] = await Promise.all([
     service.getRecommendation(),
@@ -32,17 +33,28 @@ export async function renderRecommendation(container, { service, state, drawer, 
     service.getStrategicFoundation(),
   ]);
 
-  // Only reachable in the live "Analyze a company" flow — the seeded Wix/HPS pipelines
-  // (analysis-service.js's decisionAgent) assert exactly one recommended candidate always
-  // exists, so recommendation is never null for them. A live analysis can legitimately
-  // have zero candidates pass every hard gate; StoryMap must say so honestly rather than
-  // force a choice.
-  if (!recommendation) {
+  // Both "genuinely not reached yet" (recommendation === null — an earlier stage failed,
+  // never reachable for Wix/HPS) and the canonical no_candidate_passed outcome get the
+  // SAME distinct "cannot yet recommend" screen — this wording must never be shared with
+  // stage_failed below (governing spec Phase 1: these are two different situations and
+  // must read as different situations).
+  if (!recommendation || recommendation.outcome === "no_candidate_passed") {
     renderNoRecommendation(container, candidates, onNavigate);
     return;
   }
 
+  // A technical failure on the FINAL stage only — critique already found viable
+  // candidates, but recommend_and_map itself didn't complete. Never reachable for
+  // Wix/HPS (their recommendation is always synthesized as "success" — see
+  // candidate-state.js's normalizeRecommendation). Every earlier candidate status/
+  // gateResults/evidence/diagnosis is untouched and shown as-is, not re-derived.
+  if (recommendation.outcome === "stage_failed") {
+    renderStageFailed(container, recommendation, candidates, options);
+    return;
+  }
+
   const winner = recommendation.candidate;
+  const detail = recommendation.detail;
   const others = candidates.filter((c) => c.id !== winner.id);
   const allDecisions = foundation.filter((c) => c.type === "unresolved");
   const primaryDecisions = allDecisions.filter((d) => d.priority === "primary");
@@ -101,14 +113,14 @@ export async function renderRecommendation(container, { service, state, drawer, 
       <h2>${escapeHtml(winner.name)}</h2>
       <div class="decision-statement">
         <span class="decision-statement-label">Recommended decision</span>
-        <p>${escapeHtml(recommendation.recommendedDecision)}</p>
+        <p>${escapeHtml(detail.recommendedDecision)}</p>
       </div>
       <blockquote class="recommend-quote">${escapeHtml(winner.oneSentenceStory)}</blockquote>
       <div class="why-grid">
-        <div><h4>Why this option wins</h4><p class="muted">${escapeHtml(recommendation.whyItWins)}</p></div>
-        <div><h4>Why customers should care</h4><p class="muted">${escapeHtml(recommendation.whyCustomersCare)}</p></div>
-        <div><h4>Why the company can credibly own it</h4><p class="muted">${escapeHtml(recommendation.whyCredible)}</p></div>
-        <div><h4>How it differs from competitors</h4><p class="muted">${escapeHtml(recommendation.howDifferent)}</p></div>
+        <div><h4>Why this option wins</h4><p class="muted">${escapeHtml(detail.whyItWins)}</p></div>
+        <div><h4>Why customers should care</h4><p class="muted">${escapeHtml(detail.whyCustomersCare)}</p></div>
+        <div><h4>Why the company can credibly own it</h4><p class="muted">${escapeHtml(detail.whyCredible)}</p></div>
+        <div><h4>How it differs from competitors</h4><p class="muted">${escapeHtml(detail.howDifferent)}</p></div>
       </div>
     </section>
 
@@ -150,13 +162,13 @@ export async function renderRecommendation(container, { service, state, drawer, 
     row.className = "rejected-item";
     row.innerHTML = `
       <h4>${escapeHtml(c.name)}</h4>
-      <p class="muted">${escapeHtml(recommendation.whyOthersNotSelected[c.id] || "")}</p>
+      <p class="muted">${escapeHtml(detail.whyOthersNotSelected[c.id] || "")}</p>
     `;
     rejectedList.appendChild(row);
   });
 
   if (isExploratory) {
-    wireAddSourcesPanel(container, { service, state, drawer, onNavigate });
+    wireAddSourcesPanel(container, options);
   }
 
   container.querySelector('[data-action="continue"]').addEventListener("click", () => onNavigate("map"));
@@ -287,6 +299,77 @@ function wireAddSourcesPanel(container, options) {
 function friendlyExpandSourcesError(message) {
   if (message === "source_expansion_limit_reached") return "This analysis has already used its allowed source expansions.";
   return message;
+}
+
+// A genuine technical failure on the FINAL stage — critique already found at least one
+// viable candidate, but recommend_and_map itself didn't complete validly. Deliberately
+// DISTINCT wording and screen from renderNoRecommendation below: this is not StoryMap
+// saying no direction cleared the bar, it's StoryMap saying the last step needs a retry.
+// Never reachable for Wix/HPS — see candidate-state.js's normalizeRecommendation, which
+// always synthesizes outcome "success" for their (pre-validated, always-consistent) seed
+// data.
+function renderStageFailed(container, recommendation, candidates, options) {
+  const { onNavigate } = options;
+  container.innerHTML = `
+    <section class="screen-header">
+      <div class="eyebrow">4 · Recommendation</div>
+      <h1>The final recommendation needs another attempt</h1>
+      <p class="lead">The earlier analysis and viable directions are preserved. Retry this step to complete the recommendation and Narrative Map.</p>
+    </section>
+
+    <section class="card notice-card">
+      <h3>What went wrong</h3>
+      <p class="muted small">${escapeHtml(recommendation.failureReason || "The final recommendation step did not complete.")}</p>
+      <button class="primary-button" type="button" data-action="retry-recommendation">Retry this step</button>
+      <p class="muted small" data-role="retry-error" style="display:none;color:var(--red)"></p>
+    </section>
+
+    <section class="card">
+      <h3>Candidates considered so far</h3>
+      <p class="muted small">Each candidate's status below is exactly what StoryMap's critique stage already determined — nothing here is re-evaluated.</p>
+      <div class="rejected-list" data-role="candidate-list"></div>
+    </section>
+
+    <div class="screen-footer">
+      <button class="text-link" type="button" data-action="continue">Open the Evidence Room →</button>
+    </div>
+  `;
+
+  const CANDIDATE_STATUS_LABELS = { viable: "Viable", rejected: "Rejected", pending: "Not yet evaluated" };
+  const candidateListEl = container.querySelector('[data-role="candidate-list"]');
+  candidates.forEach((c) => {
+    const row = document.createElement("div");
+    row.className = "rejected-item";
+    row.innerHTML = `
+      <h4>${escapeHtml(c.name)} <span class="muted small">(${escapeHtml(CANDIDATE_STATUS_LABELS[c.status] || c.status)})</span></h4>
+      <p class="muted">${escapeHtml(c.oneSentenceStory)}</p>
+    `;
+    candidateListEl.appendChild(row);
+  });
+
+  const retryBtn = container.querySelector('[data-action="retry-recommendation"]');
+  const errorEl = container.querySelector('[data-role="retry-error"]');
+  retryBtn.addEventListener("click", async () => {
+    retryBtn.disabled = true;
+    errorEl.style.display = "none";
+    const originalLabel = retryBtn.textContent;
+    retryBtn.textContent = "Retrying…";
+    try {
+      await retryStage("recommendation_and_map", (s) => {
+        if (s.stage) retryBtn.textContent = `Running ${s.stage.replace(/_/g, " ")}…`;
+      });
+      // Re-render in place — reflects whatever the retry actually produced: a full
+      // success view, or this same stage_failed view again with an updated attempt count.
+      await renderRecommendation(container, options);
+    } catch (err) {
+      retryBtn.disabled = false;
+      retryBtn.textContent = originalLabel;
+      errorEl.textContent = err instanceof Error ? err.message : String(err);
+      errorEl.style.display = "block";
+    }
+  });
+
+  container.querySelector('[data-action="continue"]').addEventListener("click", () => onNavigate("evidence"));
 }
 
 function renderNoRecommendation(container, candidates, onNavigate) {
