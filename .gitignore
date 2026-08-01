@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .env
 backend/job_state/
+node_modules/

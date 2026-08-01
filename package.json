@@ -1,0 +1,12 @@
+{
+  "name": "storymap-frontend-tests",
+  "private": true,
+  "type": "module",
+  "description": "Phase 2 executable frontend state tests only — the app itself ships with zero build step, zero bundler, zero framework, and stays that way. This file exists solely to run js/tests/ via Node's native test runner.",
+  "scripts": {
+    "test": "node --test \"js/tests/*.test.js\""
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.0"
+  }
+}

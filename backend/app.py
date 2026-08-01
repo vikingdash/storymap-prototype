@@ -57,6 +57,14 @@ RETRY_STAGE_TO_KIND = {
 
 app = Flask(__name__)
 
+# The frontend/backend wire contract as a whole — distinct from job_persistence's
+# JOB_STATE_SCHEMA_VERSION (that one's about checkpoint shape specifically). Bumped only
+# on a genuinely breaking change to what /status or any other endpoint returns, so an
+# already-open browser tab running stale frontend code has something to detect a mismatch
+# against (governing spec §9/§6's "stale frontend assets" gap — Phase 2 adds detection
+# only; no UI is wired to this yet, per the approved Phase 2 scope).
+API_CONTRACT_VERSION = 1
+
 MAX_URL_LENGTH = 2048
 MAX_NARRATIVE_LENGTH = 20000
 MAX_INTERNAL_DOCUMENTS = 5
@@ -453,7 +461,10 @@ def fetch_test():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok"})
+    # apiContractVersion is additive — the existing {"status": "ok"} shape is unchanged,
+    # and checkBackendAvailable() (live-analysis-service.js) only ever checked res.ok, so
+    # no existing caller is affected by this field's presence.
+    return jsonify({"status": "ok", "apiContractVersion": API_CONTRACT_VERSION})
 
 
 jobs.start_worker()

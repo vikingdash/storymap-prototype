@@ -1265,6 +1265,259 @@ class RecommendationOutcomeContract(unittest.TestCase):
         )
 
 
+# --- Phase 2: named, durable checkpoint fixtures --------------------------------------------
+# Governing spec Phase 2 ("contract tests + state fixtures"): the states this project has had
+# to re-verify by hand, repeatedly, across this session's last several turns, codified here
+# once so a future change can't silently regress them without a test failing. Each builder
+# produces a REAL checkpoint via job_persistence (through _seed_checkpoint_job), not a mock —
+# these are read back through the real jobs.get_job()/dataset-assembly code path. The
+# companion suite in js/tests/ proves these same shapes actually RENDER correctly, not just
+# parse correctly — the two layers are deliberately independent (see js/tests/helpers/fixtures.js's
+# own docstring for why the shapes are hand-mirrored rather than shared across languages).
+
+def _base_sources():
+    return [{"id": "src1", "companyId": "live", "title": "Co", "publisher": "co.com",
+             "sourceType": "website", "url": "https://co.com", "retrievedAt": "2026-01-01T00:00:00Z", "permissionStatus": "approved"}]
+
+
+def _base_evidence_pool():
+    return {"ev1": {"id": "ev1", "sourceId": "src1", "excerpt": "x", "paraphrase": "p",
+                     "evidenceType": "statement", "strength": "moderate", "freshness": "current", "verified": True, "confidence": 0.8}}
+
+
+def _base_upstream_sections():
+    """The minimal valid, already-succeeded fetching_sources/strategic_foundation/diagnosis
+    every recommendation-shaped Phase 2 fixture builds on top of."""
+    return {
+        "fetching_sources": {"sources": _base_sources(), "sourceTextById": {"src1": "text"}, "caseContext": {"id": "live", "company": {"name": "Acme"}}},
+        "strategic_foundation": {"outcome": "success", "strategicFoundation": [{"id": "sf1", "type": "customer", "statement": "x", "statementType": "source_fact", "evidence": []}], "evidencePool": _base_evidence_pool(), "attempts": []},
+        "diagnosis": {"outcome": "success", "diagnosis": [{"id": "d1", "title": "t", "explanation": "e", "significance": "medium", "statementType": "source_fact", "evidence": []}], "competitorContrasts": [], "evidencePool": _base_evidence_pool()},
+    }
+
+
+def _phase2_candidate(i, status, scores):
+    return {"id": f"cand{i}", "name": f"Candidate {i}", "oneSentenceStory": "x", "status": status, "scores": scores,
+            "gateResults": [], "rejectionReasons": [], "criticFindings": ["x"], "claims": []}
+
+
+def _seed_success_job():
+    """Fixture 1 — full success: 2 viable (one selected) + 1 rejected, narrativeMap populated."""
+    candidates = [
+        _phase2_candidate(1, "viable", {"Strategic fit": 4, "Differentiation": 4, "Evidence strength": 4}),
+        _phase2_candidate(2, "viable", {"Strategic fit": 4, "Differentiation": 3, "Evidence strength": 3}),
+        _phase2_candidate(3, "rejected", {"Strategic fit": 1, "Differentiation": 3, "Evidence strength": 3}),
+    ]
+    return _seed_checkpoint_job(
+        meta={"kind": "analyze", "status": "done", "stage": "done", "error": None, "createdAt": "2026-01-01T00:00:00Z"},
+        **_base_upstream_sections(),
+        narrative_choices={"outcome": "success", "candidates": candidates},
+        critique={"outcome": "success", "candidates": candidates},
+        recommendation_and_map={
+            "outcome": "success",
+            "attempts": [{"attempt": 1, "manual": False, "outcome": "success", "validationFailure": None, "stage": "recommendation_and_map"}],
+            "recommendation": {
+                "outcome": "success", "selectedCandidateId": "cand1", "failureReason": None,
+                "missingEvidence": ["needs more customer proof"], "leadershipDecisions": ["Should we expand?"],
+                "createdAt": "2026-01-01T00:00:00Z",
+                "detail": {"recommendedDecision": "x", "whyItWins": "x", "whyCustomersCare": "x", "whyCredible": "x", "howDifferent": "x", "tradeoffs": [], "whyOthersNotSelected": {"cand2": "x", "cand3": "x"}},
+            },
+            "narrativeMap": {
+                "id": "map1", "companyId": "live", "version": 1, "status": "draft", "candidateId": "cand1",
+                "coreNarrative": "x", "sevenParts": {k: "x" for k in ["context", "tension", "belief", "role", "value", "proof", "direction"]},
+                "coreClaims": [], "audienceIds": [], "competitorContrastIds": [], "likelyObjections": [],
+                "weakOrUnsupportedClaims": [], "unresolvedQuestions": ["Should we expand?"], "createdAt": "2026-01-01T00:00:00Z",
+            },
+            "audiences": [],
+        },
+    )
+
+
+def _seed_stage_failed_two_viable_job():
+    """Fixture 2 (also used for Fixture 4, the Evidence-Room-focused check) — critique
+    succeeded with 2 viable + 1 rejected; recommendation_and_map exhausted 3 attempts.
+    A synthetic twin of the real permanent HPS regression fixture, kept independent of
+    the on-disk file so this contract test never depends on it."""
+    candidates = [
+        _phase2_candidate(1, "viable", {"Strategic fit": 4, "Differentiation": 4, "Evidence strength": 3}),
+        _phase2_candidate(2, "viable", {"Strategic fit": 4, "Differentiation": 4, "Evidence strength": 3}),
+        _phase2_candidate(3, "rejected", {"Strategic fit": 3, "Differentiation": 3, "Evidence strength": 1}),
+    ]
+    return _seed_checkpoint_job(
+        meta={"kind": "analyze", "status": "failed", "stage": "recommendation_and_map",
+              "error": 'recommendation_and_map_stage_failed: recommendation_and_map response field "narrativeMap" must be dict, got str', "createdAt": "2026-01-01T00:00:00Z"},
+        **_base_upstream_sections(),
+        narrative_choices={"outcome": "success", "candidates": candidates},
+        critique={"outcome": "success", "candidates": candidates},
+        recommendation_and_map={
+            "outcome": "stage_failed",
+            "attempts": [
+                {"attempt": 1, "manual": False, "outcome": "failed", "validationFailure": "narrativeMap must be dict, got str", "stage": "recommendation_and_map"},
+                {"attempt": 2, "manual": False, "outcome": "failed", "validationFailure": "narrativeMap must be dict, got str", "stage": "recommendation_and_map"},
+                {"attempt": 3, "manual": False, "outcome": "failed", "validationFailure": "narrativeMap must be dict, got str", "stage": "recommendation_and_map"},
+            ],
+            "recommendation": {
+                "outcome": "stage_failed", "selectedCandidateId": None,
+                "failureReason": 'recommendation_and_map response field "narrativeMap" must be dict, got str',
+                "missingEvidence": [], "leadershipDecisions": [], "createdAt": "2026-01-01T00:00:00Z", "detail": None,
+            },
+        },
+    )
+
+
+def _seed_no_candidate_passed_job():
+    """Fixture 3 — critique rejects all three; job status is 'done', not 'failed' — the
+    exact distinguishing signal Phase 1 fixed."""
+    candidates = [
+        _phase2_candidate(1, "rejected", {"Strategic fit": 1, "Differentiation": 3, "Evidence strength": 3}),
+        _phase2_candidate(2, "rejected", {"Strategic fit": 3, "Differentiation": 1, "Evidence strength": 3}),
+        _phase2_candidate(3, "rejected", {"Strategic fit": 3, "Differentiation": 3, "Evidence strength": 1}),
+    ]
+    return _seed_checkpoint_job(
+        meta={"kind": "analyze", "status": "done", "stage": "done", "error": None, "createdAt": "2026-01-01T00:00:00Z"},
+        **_base_upstream_sections(),
+        narrative_choices={"outcome": "success", "candidates": candidates},
+        critique={"outcome": "success", "candidates": candidates},
+        recommendation_and_map={
+            "outcome": "no_candidate_passed", "attempts": [],
+            "recommendation": {
+                "outcome": "no_candidate_passed", "selectedCandidateId": None, "failureReason": None,
+                "missingEvidence": [], "leadershipDecisions": [], "createdAt": "2026-01-01T00:00:00Z", "detail": None,
+            },
+        },
+    )
+
+
+def _seed_partial_results_early_failure_job():
+    """Fixture 5 — strategic_foundation succeeded, diagnosis exhausted its 3 attempts;
+    narrative_choices/critique/recommendation_and_map never reached at all."""
+    return _seed_checkpoint_job(
+        meta={"kind": "analyze", "status": "failed", "stage": "diagnosis", "error": "diagnosis_stage_failed: x", "createdAt": "2026-01-01T00:00:00Z"},
+        fetching_sources={"sources": _base_sources(), "sourceTextById": {"src1": "text"}, "caseContext": {"id": "live", "company": {"name": "Acme"}}},
+        strategic_foundation={"outcome": "success", "strategicFoundation": [{"id": "sf1", "type": "customer", "statement": "x", "statementType": "source_fact", "evidence": []}], "evidencePool": _base_evidence_pool(), "attempts": []},
+        diagnosis={"outcome": "stage_failed", "attempts": [
+            {"attempt": 1, "manual": False, "outcome": "failed", "validationFailure": "x", "stage": "diagnosis"},
+            {"attempt": 2, "manual": False, "outcome": "failed", "validationFailure": "x", "stage": "diagnosis"},
+            {"attempt": 3, "manual": False, "outcome": "failed", "validationFailure": "x", "stage": "diagnosis"},
+        ]},
+    )
+
+
+def _seed_recommendation_upstream_valid_job(recommendation_and_map_section):
+    """Shared base for the retry-code fixtures (7a/7b) — valid upstream through critique
+    (2 viable candidates), so check_upstream_stages_valid passes and only the retry-cap
+    check itself is exercised."""
+    candidates = [
+        _phase2_candidate(1, "viable", {"Strategic fit": 4, "Differentiation": 4, "Evidence strength": 4}),
+        _phase2_candidate(2, "viable", {"Strategic fit": 4, "Differentiation": 3, "Evidence strength": 3}),
+        _phase2_candidate(3, "rejected", {"Strategic fit": 1, "Differentiation": 3, "Evidence strength": 3}),
+    ]
+    return _seed_checkpoint_job(
+        meta={"kind": "analyze", "status": "failed", "stage": "recommendation_and_map", "error": "x", "createdAt": "2026-01-01T00:00:00Z"},
+        **_base_upstream_sections(),
+        narrative_choices={"outcome": "success", "candidates": candidates},
+        critique={"outcome": "success", "candidates": candidates},
+        recommendation_and_map=recommendation_and_map_section,
+    )
+
+
+def _seed_retry_in_progress_job():
+    """Fixture 7a — a manual retry is already reserved/in flight for this stage."""
+    return _seed_recommendation_upstream_valid_job({"outcome": "stage_failed", "attempts": [], "pendingManualRetry": True})
+
+
+def _seed_retry_exhausted_job():
+    """Fixture 7b — the one allowed manual retry has already been used."""
+    return _seed_recommendation_upstream_valid_job({"outcome": "stage_failed", "attempts": [
+        {"attempt": 1, "manual": True, "outcome": "failed", "validationFailure": "x", "stage": "recommendation_and_map"},
+    ]})
+
+
+class Phase2StateFixtureContracts(unittest.TestCase):
+    """The 8 named states from the Phase 2 plan (Fixtures 6 and 8 — backend-unavailable and
+    malformed-optional-fields — have no backend checkpoint; they're frontend-only, covered
+    in js/tests/)."""
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def test_success_fixture_recommendation_and_stage_progress_shape(self):
+        job_id = _seed_success_job()
+        job = jobs.get_job(job_id)
+        rec = job["dataset"]["recommendation"]
+        self.assertEqual(rec["outcome"], "success")
+        self.assertEqual(rec["selectedCandidateId"], "cand1")
+        self.assertIsNotNone(job["dataset"]["narrativeMap"])
+        self.assertEqual(job["stageProgress"]["recommendation_and_map"]["outcome"], "success")
+
+    def test_stage_failed_fixture_two_viable_one_rejected_narrative_map_null(self):
+        job_id = _seed_stage_failed_two_viable_job()
+        job = jobs.get_job(job_id)
+        self.assertEqual(job["status"], "failed")
+        rec = job["dataset"]["recommendation"]
+        self.assertEqual(rec["outcome"], "stage_failed")
+        self.assertIsNone(rec["selectedCandidateId"])
+        self.assertIsNone(job["dataset"]["narrativeMap"])
+        statuses = sorted(c["status"] for c in job["dataset"]["candidates"])
+        self.assertEqual(statuses, ["rejected", "viable", "viable"])
+        self.assertEqual(job["stageProgress"]["recommendation_and_map"]["outcome"], "stage_failed")
+
+    def test_no_candidate_passed_fixture_status_done_not_failed(self):
+        job_id = _seed_no_candidate_passed_job()
+        job = jobs.get_job(job_id)
+        self.assertEqual(job["status"], "done")
+        rec = job["dataset"]["recommendation"]
+        self.assertEqual(rec["outcome"], "no_candidate_passed")
+        self.assertIsNone(rec["selectedCandidateId"])
+        self.assertTrue(all(c["status"] == "rejected" for c in job["dataset"]["candidates"]))
+        self.assertEqual(job["stageProgress"]["recommendation_and_map"]["outcome"], "no_candidate_passed")
+
+    def test_evidence_room_relevant_fields_present_with_narrative_map_null(self):
+        """Fixture 4 — reuses Fixture 2's checkpoint. Proves the Evidence-Room-relevant
+        fields survive independent of narrativeMap; actual screen rendering is the
+        frontend suite's job, not this one's."""
+        job_id = _seed_stage_failed_two_viable_job()
+        job = jobs.get_job(job_id)
+        ds = job["dataset"]
+        self.assertIsNone(ds["narrativeMap"])
+        self.assertTrue(ds["sources"])
+        self.assertTrue(ds["evidence"])
+        self.assertTrue(ds["strategicFoundation"])
+        self.assertTrue(ds["diagnosis"])
+        self.assertTrue(ds["candidates"])
+
+    def test_partial_results_fixture_stage_progress_attributes_correct_failed_stage(self):
+        job_id = _seed_partial_results_early_failure_job()
+        job = jobs.get_job(job_id)
+        self.assertEqual(job["status"], "failed")
+        self.assertTrue(job["dataset"]["strategicFoundation"])
+        self.assertEqual(job["dataset"]["diagnosis"], [])
+        self.assertEqual(job["dataset"]["candidates"], [])
+        self.assertIsNone(job["dataset"]["recommendation"])
+        self.assertEqual(job["stageProgress"]["diagnosis"]["outcome"], "stage_failed")
+        self.assertIsNone(job["stageProgress"]["narrative_choices"]["outcome"])
+        self.assertIsNone(job["stageProgress"]["critique"]["outcome"])
+        self.assertIsNone(job["stageProgress"]["recommendation_and_map"]["outcome"])
+
+    def test_retry_in_progress_returns_429_with_exact_code(self):
+        job_id = _seed_retry_in_progress_job()
+        resp = self.client.post(f"/api/analyze-company/{job_id}/retry/recommendation")
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(resp.get_json()["error"], "retry_in_progress")
+
+    def test_retry_exhausted_returns_429_with_exact_code(self):
+        job_id = _seed_retry_exhausted_job()
+        resp = self.client.post(f"/api/analyze-company/{job_id}/retry/recommendation")
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(resp.get_json()["error"], "retry_limit_reached")
+
+    def test_health_endpoint_returns_api_contract_version(self):
+        resp = self.client.get("/api/health")
+        body = resp.get_json()
+        self.assertEqual(body["status"], "ok")
+        self.assertIsInstance(body["apiContractVersion"], int)
+        self.assertGreaterEqual(body["apiContractVersion"], 1)
+
+
 class UsageAccumulation(unittest.TestCase):
     """checkpoint["usage"] must be a TRUE lifetime-cumulative total across every action
     ever taken on a job — never overwritten by whichever action's own usage update

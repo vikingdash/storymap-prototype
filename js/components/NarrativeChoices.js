@@ -39,6 +39,18 @@ export async function renderNarrativeChoices(container, { service, drawer, onNav
   container.querySelector('[data-action="continue"]').addEventListener("click", () => onNavigate("recommendation"));
 }
 
+// A malformed candidate (never produced by the real backend or the seeded cases today,
+// but not structurally impossible) must never crash this card over a missing optional
+// list field — and an empty <ul></ul> isn't a "clear human-readable fallback," just an
+// absence of a crash. One specific, field-appropriate message per caller, not one
+// universal string (governing spec Phase 2's malformed-field audit requirement).
+function renderListOrFallback(items, fallbackText) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return `<p class="muted small">${escapeHtml(fallbackText)}</p>`;
+  }
+  return `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
 function categorizeCandidate(candidate, selectedCandidateId) {
   if (candidate.status === "rejected") {
     const failingGate = (candidate.gateResults || []).find((g) => g.outcome === "fail");
@@ -85,7 +97,7 @@ function renderCandidateCard(candidate, drawer, selectedCandidateId) {
     `)
     .join("");
 
-  const sourceCount = candidate.claims.length;
+  const sourceCount = (candidate.claims || []).length;
 
   el.innerHTML = `
     <div class="candidate-tag">${isRecommended ? "StoryMap recommendation" : "Alternative"}</div>
@@ -105,7 +117,7 @@ function renderCandidateCard(candidate, drawer, selectedCandidateId) {
     </div>
     <div class="candidate-section">
       <h4>Primary trade-off</h4>
-      <p class="muted">${escapeHtml(candidate.tradeoffs[0] || "")}</p>
+      <p class="muted">${escapeHtml((candidate.tradeoffs || [])[0] || "")}</p>
     </div>
     ${sourceCount ? `<button type="button" class="text-link" data-action="view-sources">View ${sourceCount} source${sourceCount === 1 ? "" : "s"}</button>` : ""}
 
@@ -113,7 +125,7 @@ function renderCandidateCard(candidate, drawer, selectedCandidateId) {
       <summary>View full analysis</summary>
       <div class="candidate-section">
         <h4>Strategic logic</h4>
-        <ul>${candidate.strategicLogic.map((l) => `<li>${escapeHtml(l)}</li>`).join("")}</ul>
+        ${renderListOrFallback(candidate.strategicLogic, "No strategic logic recorded.")}
       </div>
       <div class="candidate-section">
         <h4>Scores</h4>
@@ -125,15 +137,15 @@ function renderCandidateCard(candidate, drawer, selectedCandidateId) {
       </div>
       <div class="candidate-section">
         <h4>All trade-offs</h4>
-        <ul>${candidate.tradeoffs.map((t) => `<li>${escapeHtml(t)}</li>`).join("")}</ul>
+        ${renderListOrFallback(candidate.tradeoffs, "No trade-offs recorded.")}
       </div>
       <div class="candidate-section risk-section">
         <h4>Risks</h4>
-        <ul>${candidate.risks.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>
+        ${renderListOrFallback(candidate.risks, "No risks recorded.")}
       </div>
       <div class="candidate-section critic-section">
         <h4>Narrative Critic findings</h4>
-        <ul>${candidate.criticFindings.map((f) => `<li>${escapeHtml(f)}</li>`).join("")}</ul>
+        ${renderListOrFallback(candidate.criticFindings, "No critic findings recorded.")}
       </div>
     </details>
   `;

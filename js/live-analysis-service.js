@@ -12,6 +12,7 @@
 // needs to persist across a reload the way workflow progress does.
 import { buildEvidenceIndex } from "./evidence.js";
 import { normalizeCandidates, normalizeRecommendation } from "./candidate-state.js";
+import { API_CONTRACT_VERSION } from "./build-info.js";
 
 // Derived from the browser's own address rather than hardcoded, so the same build works
 // unmodified whether the page was opened as localhost, 127.0.0.1, or a LAN IP (e.g. a
@@ -86,6 +87,23 @@ export async function checkBackendAvailable() {
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+// Detection only (governing spec's "stale frontend assets" gap, worst-detectability item
+// in the whole FMEA table) — no UI is wired to this yet; that's deferred. Returns null if
+// the backend can't be reached at all (nothing to compare against, not a mismatch), so a
+// caller must treat null and {matches:false} differently rather than conflating
+// "can't tell" with "definitely stale."
+export async function checkApiContractVersion() {
+  try {
+    const res = await withTimeout(fetch(`${BACKEND_BASE}/api/health`), HEALTH_CHECK_TIMEOUT_MS);
+    if (!res.ok) return null;
+    const body = await res.json();
+    const backendVersion = body.apiContractVersion;
+    return { matches: backendVersion === API_CONTRACT_VERSION, backendVersion, frontendVersion: API_CONTRACT_VERSION };
+  } catch {
+    return null;
   }
 }
 
