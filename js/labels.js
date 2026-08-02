@@ -3,7 +3,7 @@
 import { STATEMENT_TYPE_LABELS, EVIDENCE_RELEVANCE_LABELS } from "./schemas.js";
 
 export function statementTypeBadge(statementType) {
-  const label = STATEMENT_TYPE_LABELS[statementType] || statementType;
+  const label = STATEMENT_TYPE_LABELS[statementType] || statementType || "Unclassified";
   const className = {
     source_fact: "badge badge-fact",
     storymap_inference: "badge badge-inference",
@@ -75,6 +75,93 @@ export const DOCUMENT_ROLE_LABELS = {
 
 export function confidencePercent(confidence) {
   return `${Math.round(confidence * 100)}%`;
+}
+
+// Confidence presentation layer (UX & visual-system phase) — the DEFAULT visible signal is
+// now a plain-language label, never a percentage; confidencePercent() above is unchanged and
+// still used wherever the raw number is needed (tests, internal validation). Confidence
+// itself is never recalculated here, only classified. "Conflicting evidence" is an
+// evidence-STATE override, checked first and independent of the numeric band, since a
+// statement can carry solid overall confidence while one link actively contradicts it.
+const CONFIDENCE_BANDS = [
+  { min: 0.75, label: "Well supported", className: "sf-conf sf-conf-well" },
+  { min: 0.5, label: "Supported with gaps", className: "sf-conf sf-conf-gaps" },
+  { min: 0.3, label: "Needs confirmation", className: "sf-conf sf-conf-confirm" },
+];
+const EARLY_INTERPRETATION = { label: "Early interpretation", className: "sf-conf sf-conf-early" };
+const CONFLICTING_EVIDENCE = { label: "Conflicting evidence", className: "sf-conf sf-conf-conflict" };
+
+export function confidenceLabel(confidence, evidence) {
+  if ((evidence || []).some((link) => link.relevance === "conflicting")) {
+    return CONFLICTING_EVIDENCE;
+  }
+  const band = CONFIDENCE_BANDS.find((b) => confidence >= b.min);
+  return band ? { label: band.label, className: band.className } : EARLY_INTERPRETATION;
+}
+
+// Stage-aware judgment (governing narrative-stage decision 2): the user sees the ONE
+// judgment appropriate to a claim's maturity, never confidence and directionalCredibility
+// side by side. Same underlying visual tiers as CONFIDENCE_BANDS (well/gaps/confirm — no
+// new colors, per "distinguish via labels, not more colors") but the LABEL TEXT and which
+// number feeds it both change with narrativeStage:
+//   proven_today                    -> confidence, framed as evidence strength
+//   emerging / in_build             -> confidence, framed as evidence of movement (same
+//                                      formula — "is the commitment/movement itself real,"
+//                                      not "is the end-state already true")
+//   strategic_direction             -> directionalCredibility, framed as directional
+//                                      credibility (a lower ceiling, counts different
+//                                      evidence — see case-utils.js)
+//   aspiration_pending_leadership   -> no number at all; always "Requires leadership
+//                                      approval" — "not fully built" must never be
+//                                      presented as "not credible" by attaching a low score.
+const MOVEMENT_BANDS = [
+  { min: 0.75, label: "Well-evidenced movement", className: "sf-conf sf-conf-well" },
+  { min: 0.5, label: "Movement with gaps", className: "sf-conf sf-conf-gaps" },
+  { min: 0.3, label: "Early movement", className: "sf-conf sf-conf-confirm" },
+];
+const DIRECTIONAL_CREDIBILITY_BANDS = [
+  { min: 0.6, label: "Strong directional credibility", className: "sf-conf sf-conf-well" },
+  { min: 0.4, label: "Moderate directional credibility", className: "sf-conf sf-conf-gaps" },
+];
+const DIRECTIONAL_CREDIBILITY_LOW = { label: "Limited directional credibility", className: "sf-conf sf-conf-confirm" };
+const LEADERSHIP_APPROVAL_REQUIRED = { label: "Requires leadership approval", className: "sf-conf sf-conf-confirm" };
+
+export function narrativeStageJudgment(narrativeStage, confidence, directionalCredibility, evidence) {
+  if ((evidence || []).some((link) => link.relevance === "conflicting")) {
+    return CONFLICTING_EVIDENCE;
+  }
+  if (narrativeStage === "aspiration_pending_leadership") {
+    return LEADERSHIP_APPROVAL_REQUIRED;
+  }
+  if (narrativeStage === "strategic_direction") {
+    const band = DIRECTIONAL_CREDIBILITY_BANDS.find((b) => directionalCredibility >= b.min);
+    return band || DIRECTIONAL_CREDIBILITY_LOW;
+  }
+  const bands = narrativeStage === "emerging" || narrativeStage === "in_build" ? MOVEMENT_BANDS : CONFIDENCE_BANDS;
+  const band = bands.find((b) => confidence >= b.min);
+  return band || EARLY_INTERPRETATION;
+}
+
+// Short labels for the compact per-candidate stage-mix summary (governing narrative-stage
+// decision 8: summarize the mix on candidate directions, never a badge per claim). Deferred
+// per-claim exposure and a dedicated rationale/evidence-layer stage view are intentionally
+// NOT built in this pass — see the session report.
+const NARRATIVE_STAGE_SHORT_LABELS = {
+  proven_today: "proven today",
+  emerging: "emerging",
+  in_build: "in build",
+  strategic_direction: "direction",
+  aspiration_pending_leadership: "leadership-dependent",
+};
+
+export function narrativeStageMixSummary(narrativeStages) {
+  if (!Array.isArray(narrativeStages) || narrativeStages.length === 0) return "";
+  const counts = new Map();
+  narrativeStages.forEach((entry) => {
+    const label = NARRATIVE_STAGE_SHORT_LABELS[entry.stage] || entry.stage;
+    counts.set(label, (counts.get(label) || 0) + 1);
+  });
+  return [...counts.entries()].map(([label, n]) => `${n} ${label}`).join(" · ");
 }
 
 export function escapeHtml(value) {

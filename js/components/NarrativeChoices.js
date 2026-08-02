@@ -13,7 +13,7 @@
 // candidate's id against the separately-fetched recommendation's selectedCandidateId. The 1-5
 // criterion numbers still exist and are still real — they're just one click away, not front and
 // center implying false certainty.
-import { escapeHtml } from "../labels.js";
+import { escapeHtml, narrativeStageMixSummary } from "../labels.js";
 import { scoreBarWidthPercent, formatScore, SCORE_RUBRIC } from "../scoring.js";
 
 export async function renderNarrativeChoices(container, { service, drawer, onNavigate }) {
@@ -98,11 +98,13 @@ function renderCandidateCard(candidate, drawer, selectedCandidateId) {
     .join("");
 
   const sourceCount = (candidate.claims || []).length;
+  const stageMix = narrativeStageMixSummary(candidate.narrativeStages);
 
   el.innerHTML = `
     <div class="candidate-tag">${isRecommended ? "StoryMap recommendation" : "Alternative"}</div>
     <h3>${escapeHtml(candidate.name)}</h3>
     <p class="candidate-statement">${escapeHtml(candidate.oneSentenceStory)}</p>
+    ${stageMix ? `<p class="muted small" data-role="stage-mix">${escapeHtml(stageMix)}</p>` : ""}
 
     <div class="candidate-section">
       <h4>Why customers would care</h4>

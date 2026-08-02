@@ -66,13 +66,27 @@
  */
 
 /**
+ * Temporal/maturity axis — orthogonal to statementType (how do we know this — epistemic)
+ * and to a StrategicChoice's own `type` (what kind of claim this is). narrativeStage
+ * answers "when is this true." A claim can be storymap_synthesis + in_build at once: both
+ * axes are real and independent, neither implies the other. Model-classified for the live
+ * pipeline, never inferred from `type` — a "capability" can be proven_today, emerging, or
+ * in_build; a "way_to_win" can describe current advantage or future intent. Required on
+ * every StrategicChoice/NarrativeCoreClaim except type "unresolved" (a leadership decision
+ * about a story gap has no temporal status, exactly like it has no evidence model).
+ * @typedef {"proven_today"|"emerging"|"in_build"|"strategic_direction"|"aspiration_pending_leadership"} NarrativeStage
+ */
+
+/**
  * @typedef {Object} StrategicChoice
  * @property {string} id
  * @property {"customer"|"market"|"market_change"|"way_to_win"|"capability"|"proof"|"assumption"|"risk"|"unresolved"} type
  * @property {string} statement
  * @property {StatementType} statementType
  * @property {EvidenceLink[]} evidence
- * @property {number} confidence
+ * @property {number} confidence — evidence strength for what's actually claimed (unchanged meaning/formula); the authoritative number only for narrativeStage "proven_today", "emerging" and "in_build"
+ * @property {number} [directionalCredibility] — present only for narrativeStage "strategic_direction"/"aspiration_pending_leadership": how credible the stated DIRECTION is (intent, commitment, market logic), never "how sure are we this already exists" — see case-utils.js
+ * @property {NarrativeStage} [narrativeStage] — required for every type except "unresolved"
  * @property {"unreviewed"|"approved"|"edited"|"rejected"} approvalStatus
  * @property {"primary"|"secondary"} [priority] — only meaningful for type "unresolved": which leadership decisions are shown up front vs. under "Additional questions"
  */
@@ -90,6 +104,19 @@
  */
 
 /**
+ * One claim behind a candidate's narrative, tagged with its maturity — this is the
+ * analytical-infrastructure layer (rationale/evidence view), never the primary narrative
+ * document itself (the seven-part story stays the user-facing narrative; see
+ * NarrativeCandidate.sevenParts). Used to build the compact per-candidate stage-mix
+ * summary ("3 proven · 2 in build · 1 direction") and to feed the company-altitude /
+ * direction-coverage checks — never rendered as a per-claim badge list on its own.
+ * @typedef {Object} NarrativeStageEntry
+ * @property {NarrativeStage} stage
+ * @property {string} statement
+ * @property {EvidenceLink[]} evidence
+ */
+
+/**
  * @typedef {Object} NarrativeCandidate
  * @property {string} id
  * @property {string} name
@@ -101,6 +128,7 @@
  * @property {string[]} tradeoffs
  * @property {string[]} risks
  * @property {EvidenceLink[]} claims
+ * @property {NarrativeStageEntry[]} narrativeStages — the candidate's key claims tagged by maturity; rationale-layer data, not the narrative itself
  * @property {Record<string, number>} scores
  * @property {string[]} criticFindings
  * @property {"candidate"|"recommended"|"rejected"} status
@@ -115,6 +143,7 @@
  * @property {string} id
  * @property {string} statement
  * @property {EvidenceLink[]} evidence
+ * @property {NarrativeStage} narrativeStage
  */
 
 /**
@@ -136,6 +165,7 @@
 
 const STATEMENT_TYPES = ["source_fact", "storymap_inference", "storymap_synthesis", "recommendation", "leadership_decision", "aspiration"];
 const EVIDENCE_RELEVANCE_TYPES = ["direct", "partial", "context", "conflicting"];
+export const NARRATIVE_STAGES = ["proven_today", "emerging", "in_build", "strategic_direction", "aspiration_pending_leadership"];
 
 function fail(schemaName, record, message) {
   const label = record && record.id ? `${schemaName} "${record.id}"` : schemaName;
@@ -228,6 +258,12 @@ export function validateStrategicChoice(choice) {
   if (choice.type === "unresolved" && choice.priority !== undefined) {
     requireEnum("StrategicChoice", choice, "priority", ["primary", "secondary"]);
   }
+  // "unresolved" items are leadership decisions about a story GAP, not claims about the
+  // company — they have no temporal status, exactly like they have no evidence model /
+  // confidence (case-utils.js's recalculateConfidence skips them the same way).
+  if (choice.type !== "unresolved") {
+    requireEnum("StrategicChoice", choice, "narrativeStage", NARRATIVE_STAGES);
+  }
   return choice;
 }
 
@@ -245,6 +281,16 @@ export function validateDiagnosisFinding(finding) {
   return finding;
 }
 
+// Shared by NarrativeCandidate.narrativeStages entries — rationale/evidence-layer data,
+// never rendered as a per-claim badge on the primary narrative (see NarrativeStageEntry's
+// typedef comment above).
+function validateNarrativeStageEntry(entry, schemaName) {
+  requireEnum(schemaName, entry, "stage", NARRATIVE_STAGES);
+  requireString(schemaName, entry, "statement");
+  requireEvidenceLinkArray(schemaName, entry, "evidence");
+  return entry;
+}
+
 export function validateNarrativeCandidate(candidate) {
   requireString("NarrativeCandidate", candidate, "id");
   requireString("NarrativeCandidate", candidate, "name");
@@ -259,6 +305,8 @@ export function validateNarrativeCandidate(candidate) {
   requireArray("NarrativeCandidate", candidate, "tradeoffs", { itemsAreStrings: true });
   requireArray("NarrativeCandidate", candidate, "risks", { itemsAreStrings: true });
   requireEvidenceLinkArray("NarrativeCandidate", candidate, "claims");
+  requireArray("NarrativeCandidate", candidate, "narrativeStages");
+  candidate.narrativeStages.forEach((entry) => validateNarrativeStageEntry(entry, "NarrativeCandidate.narrativeStages[]"));
   if (typeof candidate.scores !== "object" || candidate.scores === null) {
     fail("NarrativeCandidate", candidate, `"scores" must be an object`);
   }
@@ -271,6 +319,7 @@ export function validateNarrativeCoreClaim(claim) {
   requireString("NarrativeCoreClaim", claim, "id");
   requireString("NarrativeCoreClaim", claim, "statement");
   requireEvidenceLinkArray("NarrativeCoreClaim", claim, "evidence");
+  requireEnum("NarrativeCoreClaim", claim, "narrativeStage", NARRATIVE_STAGES);
   return claim;
 }
 
@@ -321,6 +370,7 @@ export function validateDataset(dataset) {
   dataset.strategicFoundation.forEach((c) => checkEvidenceLinkRefs("StrategicChoice", c, "evidence"));
   dataset.diagnosis.forEach((f) => checkEvidenceLinkRefs("DiagnosisFinding", f, "evidence"));
   dataset.candidates.forEach((c) => checkEvidenceLinkRefs("NarrativeCandidate", c, "claims"));
+  dataset.candidates.forEach((c) => c.narrativeStages.forEach((entry) => checkEvidenceLinkRefs("NarrativeCandidate.narrativeStages[]", entry, "evidence")));
   dataset.narrativeMap.coreClaims.forEach((claim) => checkEvidenceLinkRefs("NarrativeCoreClaim", claim, "evidence"));
   (dataset.competitorContrasts || []).forEach((c) => checkEvidenceLinkRefs("CompetitorContrast", c, "evidence"));
 
@@ -345,4 +395,12 @@ export const EVIDENCE_RELEVANCE_LABELS = {
   context: "Context only",
   conflicting: "Conflicting",
   company_position: "Company's stated position",
+};
+
+export const NARRATIVE_STAGE_LABELS = {
+  proven_today: "Proven today",
+  emerging: "Emerging",
+  in_build: "In build",
+  strategic_direction: "Strategic direction",
+  aspiration_pending_leadership: "Aspiration — requires leadership approval",
 };

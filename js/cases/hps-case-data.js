@@ -591,6 +591,8 @@ const strategicFoundation = [
     type: "customer",
     statement: "Industrial, commercial and infrastructure customers with critical electrical-distribution, power-quality, power-conversion and reliability needs.",
     statementType: "storymap_inference",
+    // Who HPS serves today, read off its currently-published served-markets list.
+    narrativeStage: "proven_today",
     evidence: [
       { evidenceId: "ev_hps_markets_we_serve", relevance: "partial", rationale: "Names markets served, which implies these customer types, but is a list of served industries, not an explicit customer-priority ranking." },
       { evidenceId: "ev_aeg_industries", relevance: "partial", rationale: "Extends the same industries into AEG's served base — supports the inference, not an explicit HPS customer statement." },
@@ -603,6 +605,8 @@ const strategicFoundation = [
     type: "market",
     statement: "Electrical infrastructure applications across microgrids, utilities, industrial, semiconductors, commercial/infrastructure, data centres, mobility/transportation and renewable energy sectors.",
     statementType: "source_fact",
+    // A verbatim restatement of HPS's own current, published served-markets list.
+    narrativeStage: "proven_today",
     evidence: [
       { evidenceId: "ev_hps_markets_we_serve", relevance: "direct", rationale: "Is the exact 'Markets We Serve' list this statement restates." },
     ],
@@ -614,6 +618,11 @@ const strategicFoundation = [
     type: "market",
     statement: "North America (Canada, U.S., Mexico) and India as the historical manufacturing/sales base, with an expanded Europe and Asia presence following the AEG acquisition.",
     statementType: "storymap_synthesis",
+    // The North America/India base is proven_today, but the Europe/Asia reach is a very
+    // recent, real, evidenced expansion (AEG's facilities) not yet absorbed into HPS's own
+    // self-description (see the ev_hps_our_company_narrow context link below) — the
+    // combined claim as a whole is still being integrated, not a stable current fact.
+    narrativeStage: "in_build",
     evidence: [
       { evidenceId: "ev_hps_q4_boilerplate", relevance: "direct", rationale: "States HPS manufacturing plants are in Canada, the United States, Mexico and India." },
       { evidenceId: "ev_aeg_scale_2025", relevance: "direct", rationale: "Establishes AEG's five manufacturing facilities and revenue base, the source of the new international reach." },
@@ -627,6 +636,9 @@ const strategicFoundation = [
     type: "market_change",
     statement: "Electrical environments are becoming more complex and performance-critical, increasing demand for integrated power quality, conversion, control and lifecycle support.",
     statementType: "source_fact",
+    // A currently-observable industry trend, directly evidenced by HPS's own structural-
+    // forces framing and CEO commentary — not a claim about HPS's own future state.
+    narrativeStage: "proven_today",
     evidence: [
       { evidenceId: "ev_hps_power_landscape", relevance: "direct", rationale: "Is the exact structural-forces framing (digital infrastructure, energy transition, industrial electrification, aging infrastructure) this statement restates." },
       { evidenceId: "ev_hps_q4_ceo_quote", relevance: "direct", rationale: "CEO language directly attributes growth to the same forces: data centre expansion, infrastructure investment, industrial electrification." },
@@ -639,6 +651,11 @@ const strategicFoundation = [
     type: "way_to_win",
     statement: "Official strategic focus: (1) Customers and Markets — organic growth plus acquisitions; (2) Operational and Financial Excellence; (3) People and Culture; (4) Sustainability.",
     statementType: "source_fact",
+    // A verbatim restatement of HPS's currently-published "Our Strategic Focus" section —
+    // the claim is "this is HPS's stated focus today," which is already true, distinct
+    // from sc_hps_way_to_win below (the same `type`, but describing forward intent, not a
+    // current published fact) — proof `type` alone never determines narrativeStage.
+    narrativeStage: "proven_today",
     evidence: [
       { evidenceId: "ev_hps_strategic_focus", relevance: "direct", rationale: "Is the exact four-pillar 'Our Strategic Focus' section this statement restates verbatim." },
     ],
@@ -650,6 +667,11 @@ const strategicFoundation = [
     type: "way_to_win",
     statement: "HPS intends to combine its established transformer engineering, manufacturing scale, market access and customer trust with acquired power-quality, power-conversion, critical-power and lifecycle-service capabilities to address a broader share of customers' electrical-system needs.",
     statementType: "storymap_synthesis",
+    // Explicitly forward ("intends to combine... to address a broader share"). The
+    // individual pieces are each real (transformer engineering, AEG's acquired
+    // capabilities), but the unified combination is still being assembled — matches
+    // sc_hps_risk's note that the two-business-unit structure isn't yet one story.
+    narrativeStage: "in_build",
     evidence: [
       { evidenceId: "ev_hps_power_quality_evolution", relevance: "direct", rationale: "Directly states HPS is building on transformer expertise while expanding power-quality capabilities — the core logic this synthesis restates." },
       { evidenceId: "ev_hps_ies_launch", relevance: "direct", rationale: "Directly evidences the acquired power-conversion/critical-power/lifecycle-service capability half of the synthesis." },
@@ -664,6 +686,8 @@ const strategicFoundation = [
     type: "capability",
     statement: "Transformers, magnetics, power quality (harmonic filters, reactors), power conversion, critical power (UPS, rectifiers, DC systems), controls, lifecycle services, and 18 locations / 2,500 employees / 2,800 distributors across North America, Europe and Asia.",
     statementType: "storymap_synthesis",
+    // A heavily direct-evidenced inventory of what already exists today.
+    narrativeStage: "proven_today",
     evidence: [
       { evidenceId: "ev_hps_competitive_strengths", relevance: "direct", rationale: "Directly evidences HPS's own scale figures (18 locations, 2,500 employees, 2,800 distributors)." },
       { evidenceId: "ev_hps_ies_launch", relevance: "direct", rationale: "Directly names the combined capability set: magnetics, power quality, power conversion, critical power, controls and service." },
@@ -679,6 +703,10 @@ const strategicFoundation = [
     type: "proof",
     statement: "Public evidence shows record FY2025 and Q1 2026 sales growth, record backlog growth, expanded manufacturing capacity, and AEG's ~C$326M scale — financial and operational proof of expansion, not evidence that the broader corporate story has been established with customers.",
     statementType: "storymap_synthesis",
+    // Every figure named is an already-reported, current financial/operational fact — the
+    // statement's own caveat is about a separate (unresolved) narrative question, not
+    // about whether these figures themselves are real today.
+    narrativeStage: "proven_today",
     evidence: [
       { evidenceId: "ev_hps_revenue_2025", relevance: "direct", rationale: "This exact statistic is one of the proof points the statement lists." },
       { evidenceId: "ev_hps_backlog_2025", relevance: "direct", rationale: "This exact statistic is one of the proof points the statement lists." },
@@ -694,6 +722,10 @@ const strategicFoundation = [
     type: "assumption",
     statement: "HPS is assuming that trust and credibility built through transformers will extend to the broader IES portfolio.",
     statementType: "storymap_inference",
+    // A forward-looking bet about future customer perception, resting on HPS's own framing
+    // (context-relevance only — "no source validates whether customers actually extend
+    // that trust"). The logic behind a direction, not a proven current fact.
+    narrativeStage: "strategic_direction",
     evidence: [
       { evidenceId: "ev_hps_power_quality_evolution", relevance: "context", rationale: "Shows HPS frames the expansion as building on transformer trust, which is the assumption itself — no source validates whether customers actually extend that trust." },
     ],
@@ -705,6 +737,9 @@ const strategicFoundation = [
     type: "risk",
     statement: "The two-business-unit structure (Transformers, IES) may reinforce two parallel identities unless one corporate narrative clearly explains how they belong together.",
     statementType: "storymap_inference",
+    // The two-business-unit structure and the fragmentation risk it creates are both real,
+    // current facts about the company today — not a risk about an unrealized future.
+    narrativeStage: "proven_today",
     evidence: [
       { evidenceId: "ev_hps_two_business_units", relevance: "direct", rationale: "Directly establishes the two-business-unit structure the risk describes." },
       { evidenceId: "ev_hps_our_company_narrow", relevance: "direct", rationale: "HPS's own corporate page describing itself purely as a transformer leader — without mentioning IES — is direct evidence the two identities aren't yet unified in messaging." },
@@ -883,6 +918,26 @@ const candidates = [
       { evidenceId: "ev_hps_micron_deal", relevance: "direct", rationale: "Second of three data points in the same multi-year pattern." },
       { evidenceId: "ev_hps_capacity_investment", relevance: "direct", rationale: "Directly evidences sustained engineering/manufacturing investment behind the claim, not just messaging." },
     ],
+    // Rationale-layer maturity breakdown — reuses this candidate's own sevenParts text and
+    // claims evidence verbatim; the seven-part story above remains the narrative itself.
+    narrativeStages: [
+      {
+        stage: "in_build",
+        statement: "A North American transformer-leadership position, a disclosed multi-year expansion (Mesta 2021, Micron 2024, AEG 2026) and $100M+ of 2025 capacity investment show sustained, deliberate capability-building, not an opportunistic pivot.",
+        evidence: [
+          { evidenceId: "ev_hps_mesta_deal", relevance: "direct", rationale: "One of three data points establishing this is a deliberate multi-year build." },
+          { evidenceId: "ev_hps_micron_deal", relevance: "direct", rationale: "Second of three data points in the same multi-year pattern." },
+          { evidenceId: "ev_hps_capacity_investment", relevance: "direct", rationale: "Directly evidences sustained engineering/manufacturing investment behind the claim." },
+        ],
+      },
+      {
+        stage: "strategic_direction",
+        statement: "Extend transformer-grade engineering trust across the full IES portfolio as it matures, rather than launching it as an unrelated new story.",
+        evidence: [
+          { evidenceId: "ev_hps_power_quality_evolution", relevance: "direct", rationale: "Is HPS's own stated direction — building on transformer expertise while expanding capabilities — real signal of intent, not proof the extension is already complete." },
+        ],
+      },
+    ],
     scores: { "Strategic fit": 5, "Customer relevance": 4, "Differentiation": 4, "Evidence strength": 5, "Durability": 4 },
     criticFindings: [
       "Passes strategic-accuracy check: matches the Annual Report's own stated framing almost exactly.",
@@ -925,6 +980,27 @@ const candidates = [
       { evidenceId: "ev_hps_aeg_ceo_rationale", relevance: "direct", rationale: "CEO's own stated rationale — expanding capabilities in power electronics and integrated electrical solutions — directly supports the systems claim." },
       { evidenceId: "ev_aeg_critical_power_categories", relevance: "partial", rationale: "Shows AEG's actual product breadth, supporting that real integrated capability exists — but doesn't itself prove customers experience it as one system." },
     ],
+    // criticFindings above already flags "'engineered end to end' is stated as already
+    // true... no evidence yet of system-level delivery" — exactly the temporal-honesty
+    // gap narrativeStage exists to make explicit rather than leave implicit in critique
+    // prose. The organizational combination is real (in_build); the customer-experienced
+    // "one system" claim itself is the leadership-dependent, not-yet-operational part.
+    narrativeStages: [
+      {
+        stage: "in_build",
+        statement: "The newly formed Integrated Electrical Solutions business unit explicitly combines magnetics, power quality, power conversion, critical power, controls and service into one offering, anchored by AEG's power-electronics capability.",
+        evidence: [
+          { evidenceId: "ev_hps_ies_launch", relevance: "direct", rationale: "Is the exact HPS language describing IES as bringing multiple capabilities together — a real, completed organizational fact." },
+        ],
+      },
+      {
+        stage: "aspiration_pending_leadership",
+        statement: "Deepen system-level engineering and delivery across Transformers and IES until the two are experienced by customers as one capability, not two business units.",
+        evidence: [
+          { evidenceId: "ev_hps_aeg_ceo_rationale", relevance: "direct", rationale: "CEO's own stated rationale for the combination — real signal of intent, but the risks list itself flags this as not yet operationally proven and dependent on execution leadership owns." },
+        ],
+      },
+    ],
     scores: { "Strategic fit": 4, "Customer relevance": 4, "Differentiation": 4, "Evidence strength": 3, "Durability": 5 },
     criticFindings: [
       "Flagged: 'engineered end to end' is stated as already true, but IES only formally launched at the June 29, 2026 completion — no evidence yet of system-level delivery to customers.",
@@ -965,6 +1041,22 @@ const candidates = [
       { evidenceId: "ev_hps_power_landscape", relevance: "direct", rationale: "Is the exact HPS framing of rising electrical-system complexity this candidate's context and belief are built on." },
       { evidenceId: "ev_hps_q1_2026_results", relevance: "context", rationale: "Shows business growth consistent with rising demand, but doesn't specifically prove the 'broadest capability for complexity' claim over other framings." },
       { evidenceId: "ev_aeg_industries", relevance: "partial", rationale: "Shows AEG's industry breadth, partially supporting a 'broad capability' claim without being specific to a complexity-management story." },
+    ],
+    narrativeStages: [
+      {
+        stage: "proven_today",
+        statement: "HPS's own market analysis names four structural forces — digital infrastructure, energy transition, industrial electrification, aging infrastructure — all increasing electrical-system complexity, and it has assembled capability across the categories that respond to them.",
+        evidence: [
+          { evidenceId: "ev_hps_power_landscape", relevance: "direct", rationale: "Is the exact HPS framing of rising electrical-system complexity this candidate's context and belief are built on." },
+        ],
+      },
+      {
+        stage: "strategic_direction",
+        statement: "Keep expanding capability breadth to match the direction electrical complexity is heading, rather than anchoring the story to any one product category.",
+        evidence: [
+          { evidenceId: "ev_hps_q1_2026_results", relevance: "context", rationale: "Business growth consistent with rising demand — market signal supporting the direction, not proof of it." },
+        ],
+      },
     ],
     scores: { "Strategic fit": 4, "Customer relevance": 5, "Differentiation": 2, "Evidence strength": 4, "Durability": 4 },
     criticFindings: [
@@ -1031,6 +1123,7 @@ const narrativeMap = {
     {
       id: "claim_hps_transformer_leader",
       statement: "HPS is North America's leader in dry-type transformers.",
+      narrativeStage: "proven_today",
       evidence: [
         { evidenceId: "ev_hps_who_we_are", relevance: "direct", rationale: "Directly states this claim as part of HPS's official identity statement." },
         { evidenceId: "ev_hps_our_company_narrow", relevance: "direct", rationale: "Directly and independently restates this exact leadership claim." },
@@ -1039,6 +1132,7 @@ const narrativeMap = {
     {
       id: "claim_hps_expanding_capabilities",
       statement: "HPS is expanding beyond transformers into power quality and integrated electrical solutions.",
+      narrativeStage: "in_build",
       evidence: [
         { evidenceId: "ev_hps_expanding_beyond", relevance: "direct", rationale: "Is the exact CEO-letter statement of this expansion." },
         { evidenceId: "ev_hps_ies_launch", relevance: "direct", rationale: "Is the concrete organizational instantiation of this expansion." },
@@ -1047,6 +1141,7 @@ const narrativeMap = {
     {
       id: "claim_hps_multi_year_pattern",
       statement: "This expansion follows a deliberate multi-year acquisition pattern, not a single opportunistic deal.",
+      narrativeStage: "in_build",
       evidence: [
         { evidenceId: "ev_hps_mesta_deal", relevance: "direct", rationale: "First of three acquisitions establishing the pattern." },
         { evidenceId: "ev_hps_micron_deal", relevance: "direct", rationale: "Second of three acquisitions establishing the pattern." },
@@ -1056,6 +1151,7 @@ const narrativeMap = {
     {
       id: "claim_hps_two_units_one_story",
       statement: "HPS now operates as two business units that this narrative must connect into one story.",
+      narrativeStage: "proven_today",
       evidence: [
         { evidenceId: "ev_hps_two_business_units", relevance: "direct", rationale: "Is the exact statement of the two-business-unit structure this claim describes." },
       ],

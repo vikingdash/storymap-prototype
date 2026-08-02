@@ -56,22 +56,22 @@ from pipeline_runner import (
 
 class CandidateScoreBuilder(unittest.TestCase):
     def test_never_includes_customer_relevance(self):
-        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
+        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported", "companyAltitudeGate": "meets"}
         scores, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
         self.assertNotIn("Customer relevance", scores)
 
     def test_never_includes_durability(self):
-        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
+        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported", "companyAltitudeGate": "meets"}
         scores, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
         self.assertNotIn("Durability", scores)
 
     def test_only_expected_score_keys(self):
-        gate = {"strategicFitGate": "weak", "differentiationGate": "weak", "evidenceSupportGate": "partial"}
+        gate = {"strategicFitGate": "weak", "differentiationGate": "weak", "evidenceSupportGate": "partial", "companyAltitudeGate": "meets"}
         scores, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
-        self.assertEqual(set(scores.keys()), {"Strategic fit", "Differentiation", "Evidence strength"})
+        self.assertEqual(set(scores.keys()), {"Strategic fit", "Differentiation", "Evidence strength", "Company altitude"})
 
     def test_all_meets_passes(self):
-        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
+        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported", "companyAltitudeGate": "meets"}
         scores, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
         self.assertEqual(status, "viable")
         self.assertEqual(scores["Strategic fit"], GATE_TO_SCORE["meets"])
@@ -79,22 +79,22 @@ class CandidateScoreBuilder(unittest.TestCase):
     def test_weak_alone_still_passes(self):
         """'weak'/'partial' are the middle tier, not failures — matches the earlier test
         run's observed behavior (3 real candidates, 0 rejected, several with 'weak')."""
-        gate = {"strategicFitGate": "weak", "differentiationGate": "meets", "evidenceSupportGate": "partial"}
+        gate = {"strategicFitGate": "weak", "differentiationGate": "meets", "evidenceSupportGate": "partial", "companyAltitudeGate": "meets"}
         scores, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
         self.assertEqual(status, "viable")
 
     def test_strategic_fit_fails_rejects(self):
-        gate = {"strategicFitGate": "fails", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
+        gate = {"strategicFitGate": "fails", "differentiationGate": "meets", "evidenceSupportGate": "supported", "companyAltitudeGate": "meets"}
         _, status, _, _ = build_candidate_scores_and_status(gate)
         self.assertEqual(status, "rejected")
 
     def test_differentiation_fails_rejects(self):
-        gate = {"strategicFitGate": "meets", "differentiationGate": "fails", "evidenceSupportGate": "supported"}
+        gate = {"strategicFitGate": "meets", "differentiationGate": "fails", "evidenceSupportGate": "supported", "companyAltitudeGate": "meets"}
         _, status, _, _ = build_candidate_scores_and_status(gate)
         self.assertEqual(status, "rejected")
 
     def test_unsupported_evidence_rejects(self):
-        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "unsupported"}
+        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "unsupported", "companyAltitudeGate": "meets"}
         _, status, _, _ = build_candidate_scores_and_status(gate)
         self.assertEqual(status, "rejected")
 
@@ -112,13 +112,14 @@ class CandidateScoreBuilder(unittest.TestCase):
     def test_gate_results_has_one_entry_per_gate_with_traceable_fields(self):
         """Governing spec Phase 1, decision 3: machine-readable outcome, visible
         explanation, traceability to the gate — no parsing of prose required."""
-        gate = {"strategicFitGate": "meets", "differentiationGate": "weak", "evidenceSupportGate": "unsupported"}
+        gate = {"strategicFitGate": "meets", "differentiationGate": "weak", "evidenceSupportGate": "unsupported", "companyAltitudeGate": "meets"}
         _, _, gate_results, _ = build_candidate_scores_and_status(gate)
-        self.assertEqual(len(gate_results), 3)
+        self.assertEqual(len(gate_results), 4)
         by_id = {g["gateId"]: g for g in gate_results}
         self.assertEqual(by_id["strategicFitGate"]["outcome"], "pass")
         self.assertEqual(by_id["differentiationGate"]["outcome"], "borderline_pass")
         self.assertEqual(by_id["evidenceSupportGate"]["outcome"], "fail")
+        self.assertEqual(by_id["companyAltitudeGate"]["outcome"], "pass")
         for g in gate_results:
             self.assertIn("criterion", g)
             self.assertIn("score", g)
@@ -130,7 +131,7 @@ class CandidateScoreBuilder(unittest.TestCase):
     def test_borderline_margin_stays_visible_not_collapsed_into_plain_pass(self):
         """decision 3's explicit requirement: 'borderline margins remain visible for later
         human review' — weak/partial must never look identical to meets/supported."""
-        gate = {"strategicFitGate": "weak", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
+        gate = {"strategicFitGate": "weak", "differentiationGate": "meets", "evidenceSupportGate": "supported", "companyAltitudeGate": "meets"}
         _, _, gate_results, _ = build_candidate_scores_and_status(gate)
         outcomes = {g["gateId"]: g["outcome"] for g in gate_results}
         self.assertEqual(outcomes["strategicFitGate"], "borderline_pass")
@@ -138,7 +139,7 @@ class CandidateScoreBuilder(unittest.TestCase):
         self.assertEqual(outcomes["evidenceSupportGate"], "pass")
 
     def test_rejection_reasons_only_present_when_rejected_and_trace_to_failing_gates(self):
-        gate = {"strategicFitGate": "fails", "differentiationGate": "meets", "evidenceSupportGate": "unsupported"}
+        gate = {"strategicFitGate": "fails", "differentiationGate": "meets", "evidenceSupportGate": "unsupported", "companyAltitudeGate": "meets"}
         _, status, gate_results, rejection_reasons = build_candidate_scores_and_status(gate)
         self.assertEqual(status, "rejected")
         self.assertEqual({r["gateId"] for r in rejection_reasons}, {"strategicFitGate", "evidenceSupportGate"})
@@ -147,7 +148,7 @@ class CandidateScoreBuilder(unittest.TestCase):
             self.assertIn("explanation", r)
 
     def test_no_rejection_reasons_when_viable(self):
-        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported"}
+        gate = {"strategicFitGate": "meets", "differentiationGate": "meets", "evidenceSupportGate": "supported", "companyAltitudeGate": "meets"}
         _, status, _, rejection_reasons = build_candidate_scores_and_status(gate)
         self.assertEqual(status, "viable")
         self.assertEqual(rejection_reasons, [])
@@ -290,7 +291,7 @@ class CompetitorContrastLabeling(unittest.TestCase):
             "evidence": [EVIDENCE_ITEM("ev1", "src_live_company", "The company serves manufacturing customers.")],
             "strategicFoundation": [{
                 "id": "sf1", "type": "customer", "statement": "Serves manufacturing customers.",
-                "statementType": "source_fact", "evidence": [LINK("ev1")],
+                "statementType": "source_fact", "narrativeStage": "proven_today", "evidence": [LINK("ev1")],
             }],
         }).start()
 
@@ -351,7 +352,8 @@ def _valid_candidates():
         {"id": f"cand{i}", "name": f"Candidate {i}", "oneSentenceStory": "x",
          "sevenParts": {k: "x" for k in ["context", "tension", "belief", "role", "value", "proof", "direction"]},
          "strategicLogic": ["x"], "customerRelevance": "x", "differentiation": "x",
-         "tradeoffs": ["x"], "risks": ["x"], "claims": [LINK("ev1")]}
+         "tradeoffs": ["x"], "risks": ["x"], "claims": [LINK("ev1")],
+         "narrativeStages": [{"stage": "proven_today", "statement": "x", "evidence": [LINK("ev1")]}]}
         for i in range(1, 4)
     ]
 
@@ -359,7 +361,7 @@ def _valid_candidates():
 def _valid_critiques(candidates):
     return [
         {"candidateId": c["id"], "findings": ["ok"], "strategicFitGate": "meets",
-         "differentiationGate": "meets", "evidenceSupportGate": "supported"}
+         "differentiationGate": "meets", "evidenceSupportGate": "supported", "companyAltitudeGate": "meets"}
         for c in candidates
     ]
 
@@ -403,7 +405,7 @@ class MalformedRecordHandling(unittest.TestCase):
             "evidence": [EVIDENCE_ITEM("ev1", "src_live_company", "The company serves manufacturing customers.")],
             "strategicFoundation": [{
                 "id": "sf1", "type": "customer", "statement": "Serves manufacturing customers.",
-                "statementType": "source_fact", "evidence": [LINK("ev1")],
+                "statementType": "source_fact", "narrativeStage": "proven_today", "evidence": [LINK("ev1")],
             }],
         }
         self.diagnose_result = {
@@ -877,7 +879,7 @@ class ManualRetryForwardStages(unittest.TestCase):
             "evidence": [EVIDENCE_ITEM("ev1", "src1", "The company serves manufacturing customers directly.")],
             "strategicFoundation": [{
                 "id": "sf1", "type": "customer", "statement": "Serves manufacturing customers.",
-                "statementType": "source_fact", "evidence": [LINK("ev1")],
+                "statementType": "source_fact", "narrativeStage": "proven_today", "evidence": [LINK("ev1")],
             }],
         }
         patch("anthropic_pipeline.extract_foundation", return_value=foundation_result).start()
@@ -1326,7 +1328,7 @@ class RunPipelineFromSourcesRefactorRegression(unittest.TestCase):
             "evidence": [EVIDENCE_ITEM("ev1", "src_live_company", "The company serves manufacturing customers.")],
             "strategicFoundation": [{
                 "id": "sf1", "type": "customer", "statement": "Serves manufacturing customers.",
-                "statementType": "source_fact", "evidence": [LINK("ev1")],
+                "statementType": "source_fact", "narrativeStage": "proven_today", "evidence": [LINK("ev1")],
             }],
         }
         diagnose_result = {
@@ -1617,7 +1619,7 @@ class RoleAwarePromptPropagation(unittest.TestCase):
                 "evidence": [EVIDENCE_ITEM("ev1", "src_live_company", "The company serves manufacturing customers.")],
                 "strategicFoundation": [{
                     "id": "sf1", "type": "customer", "statement": "Serves manufacturing customers.",
-                    "statementType": "source_fact", "evidence": [LINK("ev1")],
+                    "statementType": "source_fact", "narrativeStage": "proven_today", "evidence": [LINK("ev1")],
                 }],
                 "narrativeQuestion": "Does the story hold together?",
             }
@@ -1860,7 +1862,7 @@ class PastedAndUploadedNarrativeParity(unittest.TestCase):
                 "evidence": [EVIDENCE_ITEM("ev1", narrative_source["id"], "We are the leader in X.")],
                 "strategicFoundation": [{
                     "id": "sf1", "type": "way_to_win", "statement": "The company claims leadership in X.",
-                    "statementType": "source_fact", "evidence": [LINK("ev1", "direct")],
+                    "statementType": "source_fact", "narrativeStage": "strategic_direction", "evidence": [LINK("ev1", "direct")],
                 }],
                 "narrativeQuestion": "Does the story hold together?",
             }

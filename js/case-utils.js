@@ -19,15 +19,37 @@ export const NO_DIRECT_EVIDENCE_CONFIDENCE = 0.3; // no direct/partial support a
 export const MAX_CONFIDENCE = 0.95;
 export const SINGLE_SOURCE_CONFIDENCE_CAP = 0.85;
 
+// directionalCredibility — a SEPARATE measure from confidence (narrative-stage decision 2),
+// never conflated with it: confidence answers "how sure are we this is true NOW";
+// directionalCredibility answers "how credible is this STATED DIRECTION," and is only the
+// authoritative number for narrativeStage strategic_direction/aspiration_pending_leadership.
+// It deliberately counts context-relevance and competitor/market-sourced evidence (real
+// signal for a direction, never proof of a company fact — see rule 9 in
+// anthropic_pipeline.py) and company_position links (management's own stated intent), all of
+// which confidence structurally excludes on purpose. Capped lower than confidence's 0.95: a
+// well-evidenced direction is never shown as more certain than a well-evidenced fact.
+const DIRECTIONAL_RELEVANCE_WEIGHT = { direct: 1, partial: 0.7, context: 0.5, company_position: 0.4, conflicting: 0 };
+const MARKET_LOGIC_WEIGHT = 0.5; // flat weight for any competitor/market-sourced link, regardless of its stated relevance
+export const NO_DIRECTIONAL_SUPPORT = 0.25;
+export const DIRECTIONAL_CREDIBILITY_CAP = 0.85;
+
+function isFromCompetitorSource(ev, sourceById) {
+  const source = sourceById.get(ev.sourceId);
+  return !!source && source.sourceType === "competitor";
+}
+
 // Confidence is derived, not authored: only "direct" and "partial" links can raise it, weighted
 // by how strong the underlying EvidenceItem is. "context" and "conflicting" links never
 // contribute — auditing away an irrelevant citation (like revenue growth "supporting" a customer
-// segment claim) has to actually lower confidence, or the audit is cosmetic.
-function computeConfidenceFromLinks(links, evidenceById) {
+// segment claim) has to actually lower confidence, or the audit is cosmetic. A competitor/
+// market-sourced link can never contribute here regardless of its stated relevance — company-
+// specific claims must use company-specific evidence (rule 9); even a link a case file
+// mislabeled "direct" is structurally excluded, never trusted at face value.
+function computeConfidenceFromLinks(links, evidenceById, sourceById) {
   const contributing = links
     .filter((link) => link.relevance === "direct" || link.relevance === "partial")
     .map((link) => ({ link, ev: evidenceById.get(link.evidenceId) }))
-    .filter(({ ev }) => ev);
+    .filter(({ ev }) => ev && !isFromCompetitorSource(ev, sourceById));
 
   if (!contributing.length) return NO_DIRECT_EVIDENCE_CONFIDENCE;
 
@@ -40,14 +62,32 @@ function computeConfidenceFromLinks(links, evidenceById) {
   return Math.round(Math.min(avg, cap) * 100) / 100;
 }
 
+function computeDirectionalCredibility(links, evidenceById, sourceById) {
+  const contributing = links
+    .map((link) => ({ link, ev: evidenceById.get(link.evidenceId) }))
+    .filter(({ link, ev }) => ev && link.relevance !== "conflicting");
+
+  if (!contributing.length) return NO_DIRECTIONAL_SUPPORT;
+
+  const weights = contributing.map(({ link, ev }) => {
+    const relevanceWeight = isFromCompetitorSource(ev, sourceById) ? MARKET_LOGIC_WEIGHT : (DIRECTIONAL_RELEVANCE_WEIGHT[link.relevance] ?? 0);
+    return (STRENGTH_WEIGHT[ev.strength] ?? 0) * relevanceWeight;
+  });
+  const avg = weights.reduce((sum, w) => sum + w, 0) / weights.length;
+
+  return Math.round(Math.min(avg, DIRECTIONAL_CREDIBILITY_CAP) * 100) / 100;
+}
+
 function recalculateConfidence(dataset) {
   const evidenceById = new Map(dataset.evidence.map((e) => [e.id, e]));
+  const sourceById = new Map(dataset.sources.map((s) => [s.id, s]));
   dataset.strategicFoundation.forEach((choice) => {
     if (choice.type === "unresolved") return; // leadership decisions have no evidence model; confidence stays 0
-    choice.confidence = computeConfidenceFromLinks(choice.evidence, evidenceById);
+    choice.confidence = computeConfidenceFromLinks(choice.evidence, evidenceById, sourceById);
+    choice.directionalCredibility = computeDirectionalCredibility(choice.evidence, evidenceById, sourceById);
   });
   dataset.diagnosis.forEach((finding) => {
-    finding.confidence = computeConfidenceFromLinks(finding.evidence, evidenceById);
+    finding.confidence = computeConfidenceFromLinks(finding.evidence, evidenceById, sourceById);
   });
   return dataset;
 }

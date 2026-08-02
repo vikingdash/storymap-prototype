@@ -34,9 +34,10 @@ from urllib.parse import urlparse
 
 import anthropic_pipeline as pipe
 from citation_verify import excerpt_is_verified
-from confidence import compute_confidence_from_links
+from confidence import compute_confidence_from_links, compute_directional_credibility
 from extractor import extract_readable_text
 from fetcher import FetchError, fetch_url
+from schema_constants import NARRATIVE_STAGES
 from stage_validation import (
     CANDIDATES_RESPONSE_SCHEMA,
     CRITIQUE_RESPONSE_SCHEMA,
@@ -47,6 +48,17 @@ from stage_validation import (
     validate_stage_response,
 )
 from statement_type_check import validate_diagnosis_finding, validate_strategic_choice
+
+# Stages that count as "credible evidence of company movement" for the direction-coverage
+# check below — proven_today alone never triggers it (nothing to require direction coverage
+# against if the foundation shows no movement at all).
+DIRECTION_COVERAGE_FOUNDATION_STAGES = {"emerging", "in_build", "strategic_direction"}
+# Stages a CANDIDATE's own narrativeStages entry must include to count as "a genuine
+# direction story" — deliberately excludes proven_today/emerging (a story about only what
+# already exists or is just beginning isn't a direction story) but includes
+# aspiration_pending_leadership (a clearly-flagged, leadership-owned future role still
+# counts as the company expressing where it's going).
+CANDIDATE_DIRECTION_STAGES = {"in_build", "strategic_direction", "aspiration_pending_leadership"}
 
 MAX_SUPPORTING_URLS = 5
 MAX_COMPETITOR_URLS = 3
@@ -95,6 +107,7 @@ GATE_CRITERIA = [
     ("strategicFitGate", "Strategic fit"),
     ("differentiationGate", "Differentiation"),
     ("evidenceSupportGate", "Evidence strength"),
+    ("companyAltitudeGate", "Company altitude"),
 ]
 GATE_PASS_THRESHOLD = 3
 # "weak"/"partial" map to "borderline_pass" rather than a plain "pass" specifically so a
@@ -271,9 +284,10 @@ def filter_malformed_records(items, required_keys, stage, rejected_records_repor
 
 STRATEGIC_CHOICE_REQUIRED_KEYS = ["id", "type", "statement", "statementType", "evidence"]
 DIAGNOSIS_FINDING_REQUIRED_KEYS = ["id", "title", "explanation", "significance", "statementType", "evidence"]
-CANDIDATE_REQUIRED_KEYS = ["id", "name", "oneSentenceStory", "sevenParts", "strategicLogic", "customerRelevance", "differentiation", "tradeoffs", "risks", "claims"]
-CRITIQUE_REQUIRED_KEYS = ["candidateId", "findings", "strategicFitGate", "differentiationGate", "evidenceSupportGate"]
-CORE_CLAIM_REQUIRED_KEYS = ["id", "statement", "evidence"]
+CANDIDATE_REQUIRED_KEYS = ["id", "name", "oneSentenceStory", "sevenParts", "strategicLogic", "customerRelevance", "differentiation", "tradeoffs", "risks", "claims", "narrativeStages"]
+CRITIQUE_REQUIRED_KEYS = ["candidateId", "findings", "strategicFitGate", "differentiationGate", "evidenceSupportGate", "companyAltitudeGate"]
+CORE_CLAIM_REQUIRED_KEYS = ["id", "statement", "evidence", "narrativeStage"]
+NARRATIVE_STAGE_ENTRY_REQUIRED_KEYS = ["stage", "statement", "evidence"]
 COMPETITOR_CONTRAST_REQUIRED_KEYS = ["competitor", "contrast"]
 AUDIENCE_REQUIRED_KEYS = ["name", "description"]
 EVIDENCE_ITEM_REQUIRED_KEYS = ["id", "sourceId", "excerpt", "paraphrase", "evidenceType", "strength", "freshness"]
@@ -387,7 +401,7 @@ def fetch_all_sources(company_url, supporting_urls, competitor_urls, progress_cb
     return sources, source_text_by_id, fetch_failures, company_doc
 
 
-def merge_evidence(pool, new_items, stage_prefix, source_text_by_id, dropped_links_report, rejected_records_report, source_roles_by_id=None):
+def merge_evidence(pool, new_items, stage_prefix, source_text_by_id, dropped_links_report, rejected_records_report, source_roles_by_id=None, source_types_by_id=None):
     id_map = {}
     valid_items = filter_malformed_records(new_items, EVIDENCE_ITEM_REQUIRED_KEYS, stage_prefix, rejected_records_report, "evidence item")
     for item in valid_items:
@@ -403,6 +417,12 @@ def merge_evidence(pool, new_items, stage_prefix, source_text_by_id, dropped_lin
         # (see sanitize_links's docstring) — a fact about WHERE the evidence came from,
         # not something inferred from the excerpt text itself.
         item["sourceDocumentRole"] = (source_roles_by_id or {}).get(item["sourceId"])
+        # Same pattern, same reason: WHERE evidence came from, stamped once, never asked of
+        # the model or re-derived downstream. compute_confidence_from_links (confidence.py)
+        # uses this to structurally exclude competitor/market-sourced evidence from ever
+        # proving a fact about the company being analyzed (rule 9) — even a link the model
+        # mislabeled "direct" is excluded, never trusted at face value.
+        item["fromCompetitorSource"] = (source_types_by_id or {}).get(item["sourceId"]) == "competitor"
         # EvidenceItem.confidence (schemas.js) is "extraction confidence" — how sure
         # StoryMap is that this excerpt/paraphrase was captured correctly — not the
         # claim's truth (that's the separate statement-level confidence in
@@ -476,8 +496,8 @@ def sanitize_links(record_id, links, pool, stage, dropped_links_report):
 # --- named functions so run_analysis(), regenerate_from(), and every retry_xxx() share --
 # --- exactly one copy each, per "do not create separate ad hoc checks for each call site")
 
-def process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, has_current_draft_narrative=False, company_name=None, source_roles_by_id=None):
-    id_map = merge_evidence(evidence_pool, response["evidence"], "f", source_text_by_id, dropped_links_report, rejected_records_report, source_roles_by_id)
+def process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, has_current_draft_narrative=False, company_name=None, source_roles_by_id=None, source_types_by_id=None):
+    id_map = merge_evidence(evidence_pool, response["evidence"], "f", source_text_by_id, dropped_links_report, rejected_records_report, source_roles_by_id, source_types_by_id)
     kept = []
     raw_choices = filter_malformed_records(response["strategicFoundation"], STRATEGIC_CHOICE_REQUIRED_KEYS, "strategic_foundation", rejected_records_report, "strategic-foundation item")
     for choice in raw_choices:
@@ -488,8 +508,24 @@ def process_foundation_response(response, evidence_pool, source_text_by_id, drop
         if action == "rejected":
             rejected_records_report.append({"stage": "strategic_foundation", "id": choice.get("id"), "reasons": violations})
             continue
+        # narrativeStage (rule 13) — a SEPARATE temporal axis from statementType, checked
+        # here rather than in statement_type_check.py (which stays scoped to statementType/
+        # type compatibility). Required for every non-"unresolved" item; never inferred from
+        # `type` — a model that omits/invents an invalid value is rejected for regeneration,
+        # never silently defaulted to a guessed stage.
+        if choice["type"] == "unresolved":
+            choice["narrativeStage"] = None
+        else:
+            stage = choice.get("narrativeStage")
+            if stage not in NARRATIVE_STAGES:
+                rejected_records_report.append({
+                    "stage": "strategic_foundation", "id": choice.get("id"),
+                    "reasons": [f'"{choice["id"]}" has invalid or missing narrativeStage "{stage}" — rejecting for regeneration'],
+                })
+                continue
         choice["statementType"] = corrected
         choice["confidence"] = None if choice["type"] == "unresolved" else compute_confidence_from_links(choice["evidence"], evidence_pool)
+        choice["directionalCredibility"] = None if choice["type"] == "unresolved" else compute_directional_credibility(choice["evidence"], evidence_pool)
         choice["approvalStatus"] = "unreviewed"
         kept.append(choice)
     # .get() here, not response["narrativeQuestion"] — the tool schema marks this required
@@ -500,8 +536,8 @@ def process_foundation_response(response, evidence_pool, source_text_by_id, drop
     return kept, narrative_question
 
 
-def process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id=None):
-    id_map = merge_evidence(evidence_pool, response["evidence"], "d", source_text_by_id, dropped_links_report, rejected_records_report, source_roles_by_id)
+def process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id=None, source_types_by_id=None):
+    id_map = merge_evidence(evidence_pool, response["evidence"], "d", source_text_by_id, dropped_links_report, rejected_records_report, source_roles_by_id, source_types_by_id)
     kept = []
     raw_findings = filter_malformed_records(response["diagnosis"], DIAGNOSIS_FINDING_REQUIRED_KEYS, "diagnosis", rejected_records_report, "diagnosis finding")
     for finding in raw_findings:
@@ -524,18 +560,72 @@ def process_diagnosis_response(response, evidence_pool, source_text_by_id, dropp
     return kept, competitor_contrasts
 
 
+def process_narrative_stage_entries(candidate_id, raw_entries, evidence_pool, dropped_links_report, rejected_records_report):
+    """Validates and sanitizes a candidate's narrativeStages array (rationale/evidence-layer
+    data — see NARRATIVE_STAGE_ENTRY_REQUIRED_KEYS). Individual malformed/invalid-stage
+    entries are dropped and reported, never coerced — this never rejects the whole
+    candidate; an empty result just means no stage-mix summary is available for it."""
+    raw = filter_malformed_records(raw_entries, NARRATIVE_STAGE_ENTRY_REQUIRED_KEYS, "candidates", rejected_records_report, "narrative-stage entry")
+    kept = []
+    for entry in raw:
+        if entry.get("stage") not in NARRATIVE_STAGES:
+            rejected_records_report.append({
+                "stage": "candidates", "id": candidate_id,
+                "reasons": [f'narrativeStages entry has invalid stage "{entry.get("stage")}" — dropped'],
+            })
+            continue
+        entry["evidence"] = sanitize_links(candidate_id, entry["evidence"], evidence_pool, "candidates", dropped_links_report)
+        kept.append(entry)
+    return kept
+
+
 def process_candidates_response(response, evidence_pool, dropped_links_report, rejected_records_report):
     candidates = filter_malformed_records(response["candidates"], CANDIDATE_REQUIRED_KEYS, "candidates", rejected_records_report, "narrative candidate")
     if len(candidates) != 3:
         rejected_records_report.append({"stage": "candidates", "id": None, "reasons": [f"expected exactly 3 candidates, got {len(candidates)}"]})
     for cand in candidates:
         cand["claims"] = sanitize_links(cand["id"], cand["claims"], evidence_pool, "candidates", dropped_links_report)
+        cand["narrativeStages"] = process_narrative_stage_entries(cand["id"], cand["narrativeStages"], evidence_pool, dropped_links_report, rejected_records_report)
         cand["status"] = CANDIDATE_STATUS_PENDING
         cand["gateResults"] = []
         cand["rejectionReasons"] = []
         cand["statusEvaluatedAtStage"] = "narrative_choices"
         cand["statusUpdatedAt"] = now_iso()
     return candidates
+
+
+class DirectionCoverageError(ValueError):
+    """Raised when the strategic foundation shows credible evidence of company movement
+    (an emerging/in_build/strategic_direction item) but none of the 3 generated candidates
+    include a company-level direction claim (an in_build/strategic_direction/
+    aspiration_pending_leadership entry in their own narrativeStages) — see rule 13 and
+    generate_candidates' "DIRECTION COVERAGE" instruction. Caught by the same attempt/retry
+    machinery as every other stage-specific validation failure (ATTEMPT_EXCEPTIONS), so this
+    costs a retry with the reason fed back to the model, not a crash. Never raised when the
+    foundation itself shows no movement — nothing to require direction coverage against."""
+    pass
+
+
+def check_direction_coverage(strategic_foundation, candidates):
+    has_movement_evidence = any(
+        c.get("type") != "unresolved" and c.get("narrativeStage") in DIRECTION_COVERAGE_FOUNDATION_STAGES
+        for c in strategic_foundation
+    )
+    if not has_movement_evidence:
+        return
+    has_direction_candidate = any(
+        any(entry.get("stage") in CANDIDATE_DIRECTION_STAGES for entry in (cand.get("narrativeStages") or []))
+        for cand in candidates
+    )
+    if not has_direction_candidate:
+        raise DirectionCoverageError(
+            "The strategic foundation shows credible evidence of company movement "
+            "(emerging/in_build/strategic_direction items exist), but none of the 3 "
+            "candidates include a company-level in_build/strategic_direction/"
+            "aspiration_pending_leadership claim in their narrativeStages. At least one "
+            "candidate must be a genuine direction story — where the company is going — "
+            "not only current-state reflections."
+        )
 
 
 def process_critique_response(response, candidates, rejected_records_report):
@@ -551,7 +641,7 @@ def process_critique_response(response, candidates, rejected_records_report):
         if gate is None:
             rejected_records_report.append({"stage": "critique", "id": cand["id"], "reasons": ["no critique returned for this candidate"]})
             cand["status"] = CANDIDATE_STATUS_REJECTED
-            cand["scores"] = {"Strategic fit": 1, "Differentiation": 1, "Evidence strength": 1}
+            cand["scores"] = {"Strategic fit": 1, "Differentiation": 1, "Evidence strength": 1, "Company altitude": 1}
             cand["criticFindings"] = ["No critique was returned for this candidate — treated as failing."]
             cand["gateResults"] = []
             cand["rejectionReasons"] = [{"code": "no_critique_returned", "gateId": None, "explanation": "No critique was returned for this candidate — treated as failing."}]
@@ -597,9 +687,17 @@ def process_recommend_and_map_response(response, survivors, all_candidates, evid
     # strings) — the class of check "do not create ad hoc checks unless genuinely unique"
     # explicitly allows keeping separate from the generic envelope validator.
     validate_narrative_map_shape(nm)
-    core_claims = filter_malformed_records(nm["coreClaims"], CORE_CLAIM_REQUIRED_KEYS, "narrative_map", rejected_records_report, "core claim")
-    for claim in core_claims:
+    raw_core_claims = filter_malformed_records(nm["coreClaims"], CORE_CLAIM_REQUIRED_KEYS, "narrative_map", rejected_records_report, "core claim")
+    core_claims = []
+    for claim in raw_core_claims:
+        if claim.get("narrativeStage") not in NARRATIVE_STAGES:
+            rejected_records_report.append({
+                "stage": "narrative_map", "id": claim.get("id"),
+                "reasons": [f'core claim has invalid or missing narrativeStage "{claim.get("narrativeStage")}" — dropped'],
+            })
+            continue
         claim["evidence"] = sanitize_links(claim["id"], claim["evidence"], evidence_pool, "narrative_map", dropped_links_report)
+        core_claims.append(claim)
     narrative_map = {
         "id": map_id,
         "companyId": "live",
@@ -625,7 +723,7 @@ def process_recommend_and_map_response(response, survivors, all_candidates, evid
 # exception (auth, network, rate limit) is NOT in this tuple and propagates immediately,
 # uncaught, exactly like PipelineError does. That is what makes "do not retry hard
 # failures" true by construction rather than by a separate check.
-ATTEMPT_EXCEPTIONS = (StageResponseError, KeyError, TypeError, StopIteration, NarrativeMapValidationError, RecommendationValidationError)
+ATTEMPT_EXCEPTIONS = (StageResponseError, KeyError, TypeError, StopIteration, NarrativeMapValidationError, RecommendationValidationError, DirectionCoverageError)
 
 
 def _attempt_stage_once(stage_name, required_schema, api_call_fn, process_fn, usage, prior_failure):
@@ -1120,6 +1218,7 @@ def run_pipeline_from_sources(sources, source_text_by_id, existing_narrative, ca
     has_current_draft_narrative = any(s.get("role") == "current_draft_narrative" for s in non_competitor)
     company_name = (case_context or {}).get("company", {}).get("name")
     source_roles_by_id = {s["id"]: s.get("documentRole") for s in sources}
+    source_types_by_id = {s["id"]: s.get("sourceType") for s in sources}
 
     context = {"sources": sources, "source_text_by_id": source_text_by_id, "evidence_pool": {}}
 
@@ -1161,7 +1260,7 @@ def run_pipeline_from_sources(sources, source_text_by_id, existing_narrative, ca
     foundation_result, outcome, stage_failure, tb, attempts = run_model_stage(
         "strategic_foundation", FOUNDATION_RESPONSE_SCHEMA,
         lambda pf: pipe.extract_foundation(client, usage, non_competitor, prior_failure=pf),
-        lambda response: process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, has_current_draft_narrative, company_name, source_roles_by_id),
+        lambda response: process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, has_current_draft_narrative, company_name, source_roles_by_id, source_types_by_id),
         usage, progress_cb,
     )
     if outcome == "stage_failed":
@@ -1172,11 +1271,11 @@ def run_pipeline_from_sources(sources, source_text_by_id, existing_narrative, ca
     case_context = {**case_context, "narrativeQuestion": narrative_question}
 
     # --- Stage: diagnosis ---
-    foundation_summary = [{"id": c["id"], "type": c["type"], "statement": c["statement"], "statementType": c["statementType"]} for c in strategic_foundation]
+    foundation_summary = [{"id": c["id"], "type": c["type"], "statement": c["statement"], "statementType": c["statementType"], "narrativeStage": c.get("narrativeStage")} for c in strategic_foundation]
     diag_result, outcome, stage_failure, tb, attempts = run_model_stage(
         "diagnosis", DIAGNOSIS_RESPONSE_SCHEMA,
         lambda pf: pipe.diagnose(client, usage, non_competitor, foundation_summary, competitor_sources, existing_narrative, evidence_pool, prior_failure=pf),
-        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id),
+        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id, source_types_by_id),
         usage, progress_cb,
     )
     if outcome == "stage_failed":
@@ -1186,11 +1285,16 @@ def run_pipeline_from_sources(sources, source_text_by_id, existing_narrative, ca
     persist_cb("diagnosis", {"outcome": "success", "attempts": attempts, "diagnosis": diagnosis, "competitorContrasts": competitor_contrasts, "evidencePool": evidence_pool})
 
     # --- Stage: narrative_choices ---
+    def _process_candidates_and_check_coverage(response):
+        candidates = process_candidates_response(response, evidence_pool, dropped_links_report, rejected_records_report)
+        check_direction_coverage(strategic_foundation, candidates)
+        return candidates
+
     diagnosis_summary = [{"id": f["id"], "title": f["title"], "significance": f["significance"]} for f in diagnosis]
     cand_result, outcome, stage_failure, tb, attempts = run_model_stage(
         "narrative_choices", CANDIDATES_RESPONSE_SCHEMA,
         lambda pf: pipe.generate_candidates(client, usage, foundation_summary, diagnosis_summary, evidence_pool, prior_failure=pf),
-        lambda response: process_candidates_response(response, evidence_pool, dropped_links_report, rejected_records_report),
+        _process_candidates_and_check_coverage,
         usage, progress_cb,
     )
     if outcome == "stage_failed":
@@ -1269,9 +1373,10 @@ def regenerate_from(sources, source_text_by_id, evidence_pool, edited_foundation
     non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] != "competitor"]
     competitor_sources = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] == "competitor"]
     source_roles_by_id = {s["id"]: s.get("documentRole") for s in sources}
+    source_types_by_id = {s["id"]: s.get("sourceType") for s in sources}
 
     strategic_foundation = edited_foundation
-    foundation_summary = [{"id": c["id"], "type": c["type"], "statement": c["statement"], "statementType": c["statementType"]} for c in strategic_foundation]
+    foundation_summary = [{"id": c["id"], "type": c["type"], "statement": c["statement"], "statementType": c["statementType"], "narrativeStage": c.get("narrativeStage")} for c in strategic_foundation]
 
     def _empty_return(outcome, stage_failure, tb, diagnosis, candidates, competitor_contrasts, recommendation, narrative_map, audiences):
         diagnostics = _diagnostics_for_outcome(outcome, stage_failure, {
@@ -1296,7 +1401,7 @@ def regenerate_from(sources, source_text_by_id, evidence_pool, edited_foundation
     diag_result, outcome, stage_failure, tb, attempts = run_model_stage(
         "diagnosis", DIAGNOSIS_RESPONSE_SCHEMA,
         lambda pf: pipe.diagnose(client, usage, non_competitor, foundation_summary, competitor_sources, existing_narrative, evidence_pool, prior_failure=pf),
-        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id),
+        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id, source_types_by_id),
         usage, progress_cb,
     )
     if outcome == "stage_failed":
@@ -1305,11 +1410,16 @@ def regenerate_from(sources, source_text_by_id, evidence_pool, edited_foundation
     diagnosis, competitor_contrasts = diag_result
     persist_cb("diagnosis", {"outcome": "success", "attempts": attempts, "diagnosis": diagnosis, "competitorContrasts": competitor_contrasts, "evidencePool": evidence_pool})
 
+    def _process_candidates_and_check_coverage(response):
+        candidates = process_candidates_response(response, evidence_pool, dropped_links_report, rejected_records_report)
+        check_direction_coverage(strategic_foundation, candidates)
+        return candidates
+
     diagnosis_summary = [{"id": f["id"], "title": f["title"], "significance": f["significance"]} for f in diagnosis]
     cand_result, outcome, stage_failure, tb, attempts = run_model_stage(
         "narrative_choices", CANDIDATES_RESPONSE_SCHEMA,
         lambda pf: pipe.generate_candidates(client, usage, foundation_summary, diagnosis_summary, evidence_pool, prior_failure=pf),
-        lambda response: process_candidates_response(response, evidence_pool, dropped_links_report, rejected_records_report),
+        _process_candidates_and_check_coverage,
         usage, progress_cb,
     )
     if outcome == "stage_failed":
@@ -1374,11 +1484,12 @@ def retry_extract_foundation(sources, source_text_by_id, existing_narrative="", 
     non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] != "competitor"]
     has_current_draft_narrative = any(s.get("role") == "current_draft_narrative" for s in non_competitor)
     source_roles_by_id = {s["id"]: s.get("documentRole") for s in sources}
+    source_types_by_id = {s["id"]: s.get("sourceType") for s in sources}
     progress_cb("strategic_foundation")
     result, outcome, error_info, tb, attempt_usage = _attempt_stage_once(
         "strategic_foundation", FOUNDATION_RESPONSE_SCHEMA,
         lambda pf: pipe.extract_foundation(client, usage, non_competitor, prior_failure=pf),
-        lambda response: process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, has_current_draft_narrative, company_name, source_roles_by_id),
+        lambda response: process_foundation_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, has_current_draft_narrative, company_name, source_roles_by_id, source_types_by_id),
         usage, prior_failure,
     )
     strategic_foundation, narrative_question = result if outcome == "success" else ([], None)
@@ -1405,14 +1516,15 @@ def retry_diagnose(sources, source_text_by_id, evidence_pool, strategic_foundati
 
     non_competitor = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] != "competitor"]
     competitor_sources = [{"id": s["id"], "text": source_text_by_id[s["id"]], "role": s.get("documentRole")} for s in sources if s["sourceType"] == "competitor"]
-    foundation_summary = [{"id": c["id"], "type": c["type"], "statement": c["statement"], "statementType": c["statementType"]} for c in strategic_foundation]
+    foundation_summary = [{"id": c["id"], "type": c["type"], "statement": c["statement"], "statementType": c["statementType"], "narrativeStage": c.get("narrativeStage")} for c in strategic_foundation]
     source_roles_by_id = {s["id"]: s.get("documentRole") for s in sources}
+    source_types_by_id = {s["id"]: s.get("sourceType") for s in sources}
 
     progress_cb("diagnosis")
     result, outcome, error_info, tb, attempt_usage = _attempt_stage_once(
         "diagnosis", DIAGNOSIS_RESPONSE_SCHEMA,
         lambda pf: pipe.diagnose(client, usage, non_competitor, foundation_summary, competitor_sources, existing_narrative, evidence_pool, prior_failure=pf),
-        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id),
+        lambda response: process_diagnosis_response(response, evidence_pool, source_text_by_id, dropped_links_report, rejected_records_report, statement_type_violations, source_roles_by_id, source_types_by_id),
         usage, prior_failure,
     )
     diagnosis, competitor_contrasts = result if outcome == "success" else ([], [])
@@ -1434,11 +1546,16 @@ def retry_generate_candidates(evidence_pool, foundation_summary, diagnosis_summa
     usage = pipe.UsageTracker()
     dropped_links_report, rejected_records_report = [], []
 
+    def _process_candidates_and_check_coverage(response):
+        candidates = process_candidates_response(response, evidence_pool, dropped_links_report, rejected_records_report)
+        check_direction_coverage(foundation_summary, candidates)
+        return candidates
+
     progress_cb("narrative_choices")
     result, outcome, error_info, tb, attempt_usage = _attempt_stage_once(
         "narrative_choices", CANDIDATES_RESPONSE_SCHEMA,
         lambda pf: pipe.generate_candidates(client, usage, foundation_summary, diagnosis_summary, evidence_pool, prior_failure=pf),
-        lambda response: process_candidates_response(response, evidence_pool, dropped_links_report, rejected_records_report),
+        _process_candidates_and_check_coverage,
         usage, prior_failure,
     )
     candidates = result if outcome == "success" else []

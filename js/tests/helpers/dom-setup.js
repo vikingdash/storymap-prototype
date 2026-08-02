@@ -25,6 +25,13 @@ export function setupJSDOM() {
   // sources" flow ever calls confirm(), which none of the Phase 2 fixtures exercise, but
   // leaving it undefined would throw the moment any code path touched it.
   globalThis.confirm = () => true;
+  // jsdom also doesn't implement Element.scrollIntoView at all (a well-known gap, not a
+  // real-browser difference) -- StrategicFoundation.js's review-strip jump-links call it.
+  // A no-op default here; individual tests that need to assert on the call still override
+  // it per-element, which shadows this prototype default normally.
+  if (!dom.window.HTMLElement.prototype.scrollIntoView) {
+    dom.window.HTMLElement.prototype.scrollIntoView = function scrollIntoView() {};
+  }
   return dom;
 }
 

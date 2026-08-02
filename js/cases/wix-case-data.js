@@ -300,6 +300,9 @@ const strategicFoundation = [
     type: "customer",
     statement: "Individuals, entrepreneurs, agencies and businesses that need to create and operate a professional online presence.",
     statementType: "storymap_inference",
+    // Describes who Wix serves today, off its current product description — a present-tense
+    // read of the existing customer base, not a forward claim.
+    narrativeStage: "proven_today",
     evidence: [
       {
         evidenceId: "ev_self_description",
@@ -315,6 +318,9 @@ const strategicFoundation = [
     type: "market",
     statement: "Website creation and small-business digital operations, reached primarily online and self-serve, across the markets where Wix operates.",
     statementType: "storymap_inference",
+    // The market Wix operates in today, read off its current product — not a stated future
+    // expansion (compare sc_way_to_win/candidate "direction" entries, which are).
+    narrativeStage: "proven_today",
     evidence: [
       {
         evidenceId: "ev_self_description",
@@ -330,6 +336,9 @@ const strategicFoundation = [
     type: "market_change",
     statement: "AI is reducing the time and technical effort required to create websites and software, while users still want control over brand and quality.",
     statementType: "storymap_inference",
+    // A currently-observable market condition (both halves are directly evidenced by
+    // present usage data), not something Wix itself is still building toward.
+    narrativeStage: "proven_today",
     evidence: [
       {
         evidenceId: "ev_publish_speed",
@@ -350,6 +359,11 @@ const strategicFoundation = [
     type: "way_to_win",
     statement: "Combine AI-assisted creation, manual control, business tools and scalable infrastructure in one platform.",
     statementType: "storymap_inference",
+    // The individual pieces (Harmony, Aria, Base44) each already exist and are proven
+    // (see sc_capabilities) — what's still being assembled is the ONE-PLATFORM framing
+    // itself, which sc_risk_1 explicitly flags as not yet coherent. Real components, still
+    // being combined into one story: in_build, not proven_today or mere aspiration.
+    narrativeStage: "in_build",
     evidence: [
       {
         evidenceId: "ev_harmony_framing",
@@ -375,6 +389,9 @@ const strategicFoundation = [
     type: "capability",
     statement: "Wix Harmony, Aria, a proprietary AI model, a large existing user base, business applications, and Base44 are the company's stated capabilities.",
     statementType: "storymap_synthesis",
+    // Every named capability has direct current evidence it already exists (Base44's ARR,
+    // Aria's adoption) — an inventory of what's real today, not a roadmap.
+    narrativeStage: "proven_today",
     evidence: [
       {
         evidenceId: "ev_harmony_model",
@@ -400,6 +417,8 @@ const strategicFoundation = [
     type: "proof",
     statement: "Public evidence shows faster site creation, strong Aria adoption, double-digit Q1 bookings and revenue growth, accelerated new-user bookings, and Base44 approaching $150M ARR.",
     statementType: "storymap_synthesis",
+    // Every figure named is a current, already-measured performance statistic.
+    narrativeStage: "proven_today",
     evidence: [
       { evidenceId: "ev_publish_speed", relevance: "direct", rationale: "This exact statistic is one of the proof points the statement lists." },
       { evidenceId: "ev_aria_adoption", relevance: "direct", rationale: "This exact statistic is one of the proof points the statement lists." },
@@ -415,6 +434,11 @@ const strategicFoundation = [
     type: "assumption",
     statement: "Wix is assuming customers will value 'AI speed plus retained control' more than pure automation as AI tools mature.",
     statementType: "storymap_inference",
+    // A forward-looking bet about how customer preference evolves "as AI tools mature" —
+    // grounded in Wix's own design intent, but explicitly not independently validated
+    // (see the evidence rationale below). The market-preference logic behind a direction,
+    // not a claim about the company's current state.
+    narrativeStage: "strategic_direction",
     evidence: [
       {
         evidenceId: "ev_harmony_tension",
@@ -435,6 +459,9 @@ const strategicFoundation = [
     type: "risk",
     statement: "The product portfolio (Wix core, Harmony, Aria, Base44) risks reading as several separate innovations rather than one strategic direction.",
     statementType: "storymap_inference",
+    // A live vulnerability in how today's already-existing portfolio reads right now, not
+    // a risk about an unrealized future state.
+    narrativeStage: "proven_today",
     evidence: [
       {
         evidenceId: "ev_harmony_model",
@@ -599,7 +626,7 @@ const candidates = [
       context: "AI is making it possible to create websites, software and business experiences far faster than before.",
       tension: "Speed can come with a loss of control, distinctiveness or confidence in the finished result.",
       belief: "AI should expand what people can create without taking ownership of the result away from them.",
-      role: "Wix combines AI assistance, precise manual control, business tools and scalable infrastructure in one creation environment.",
+      role: "Wix is assembling AI assistance, precise manual control, business tools and scalable infrastructure into one creation environment.",
       value: "People can move from idea to a professional, working digital business faster while keeping the result recognizably theirs.",
       proof: "Public Wix evidence indicates faster publishing, strong use of AI assistance and continued active user editing.",
       direction: "Expand from website creation toward a broader platform where people and AI build and operate digital businesses together.",
@@ -625,6 +652,26 @@ const candidates = [
       { evidenceId: "ev_user_editing", relevance: "direct", rationale: "Directly evidences the 'without giving up control' half of this candidate's core claim." },
       { evidenceId: "ev_aria_adoption", relevance: "direct", rationale: "Directly evidences that AI assistance is broadly used, supporting the 'speed of AI' half of the claim." },
       { evidenceId: "ev_harmony_tension", relevance: "direct", rationale: "Is Wix's own statement of the exact speed-versus-control tension this candidate's story is built on." },
+    ],
+    // Rationale-layer maturity breakdown (not narrative prose — see sevenParts above for
+    // the actual connected story). Reuses this candidate's own existing sevenParts text
+    // and claims evidence verbatim; adds no new statements or citations.
+    narrativeStages: [
+      {
+        stage: "proven_today",
+        statement: "Public Wix evidence indicates faster publishing, strong use of AI assistance and continued active user editing.",
+        evidence: [
+          { evidenceId: "ev_publish_speed", relevance: "direct", rationale: "Directly evidences the 'speed' half of this candidate's core claim." },
+          { evidenceId: "ev_user_editing", relevance: "direct", rationale: "Directly evidences the 'without giving up control' half of this candidate's core claim." },
+        ],
+      },
+      {
+        stage: "strategic_direction",
+        statement: "Expand from website creation toward a broader platform where people and AI build and operate digital businesses together.",
+        evidence: [
+          { evidenceId: "ev_harmony_tension", relevance: "partial", rationale: "Wix's own stated design intent — real signal of direction, not independent proof the broader platform is already built." },
+        ],
+      },
     ],
     scores: { "Strategic fit": 5, "Customer relevance": 5, "Differentiation": 4, "Evidence strength": 5, "Durability": 4 },
     criticFindings: [
@@ -667,6 +714,22 @@ const candidates = [
       { evidenceId: "ev_bookings_growth", relevance: "context", rationale: "Shows overall company growth, but doesn't specifically support an 'operating system' positioning over any other growth narrative." },
       { evidenceId: "ev_new_user_growth", relevance: "context", rationale: "Shows new-user momentum, but doesn't specifically support an 'operating system' positioning over any other growth narrative." },
     ],
+    narrativeStages: [
+      {
+        stage: "in_build",
+        statement: "Base44 approaching $150M ARR and double-digit bookings and revenue growth show platform-wide traction beyond website creation alone.",
+        evidence: [
+          { evidenceId: "ev_base44_arr", relevance: "direct", rationale: "Directly evidences that Wix has a real, substantial product beyond website creation." },
+        ],
+      },
+      {
+        stage: "strategic_direction",
+        statement: "Extend from website creation into a full AI-run operating layer for online businesses.",
+        evidence: [
+          { evidenceId: "ev_bookings_growth", relevance: "context", rationale: "General company growth is real signal of momentum behind the direction, not proof the operating-layer positioning is already established." },
+        ],
+      },
+    ],
     scores: { "Strategic fit": 5, "Customer relevance": 4, "Differentiation": 3, "Evidence strength": 3, "Durability": 5 },
     criticFindings: [
       "Flagged: “operating system” is a category convention already used broadly across software — real differentiation risk.",
@@ -706,6 +769,22 @@ const candidates = [
     claims: [
       { evidenceId: "ev_publish_speed", relevance: "direct", rationale: "Directly evidences the 'faster than before' half of this candidate's claim." },
       { evidenceId: "ev_new_user_growth", relevance: "context", rationale: "Shows new-user momentum, which is consistent with — but doesn't specifically prove — an 'idea to working business' framing over any other framing." },
+    ],
+    narrativeStages: [
+      {
+        stage: "proven_today",
+        statement: "Publishing time fell from eight days to four, and new-user bookings grew about 46% year over year.",
+        evidence: [
+          { evidenceId: "ev_publish_speed", relevance: "direct", rationale: "Directly evidences the 'faster than before' half of this candidate's claim." },
+        ],
+      },
+      {
+        stage: "strategic_direction",
+        statement: "Keep lowering the time and skill needed to go from idea to a working online business.",
+        evidence: [
+          { evidenceId: "ev_new_user_growth", relevance: "context", rationale: "New-user momentum is consistent with the direction, not itself proof the trend will continue." },
+        ],
+      },
     ],
     scores: { "Strategic fit": 4, "Customer relevance": 5, "Differentiation": 2, "Evidence strength": 3, "Durability": 4 },
     criticFindings: [
@@ -772,7 +851,7 @@ const narrativeMap = {
     context: "AI is making it possible to create websites, software and business experiences far faster than before.",
     tension: "Speed can come with a loss of control, distinctiveness or confidence in the finished result.",
     belief: "AI should expand what people can create without taking ownership of the result away from them.",
-    role: "Wix combines AI assistance, precise manual control, business tools and scalable infrastructure in one creation environment.",
+    role: "Wix is assembling AI assistance, precise manual control, business tools and scalable infrastructure into one creation environment.",
     value: "People can move from idea to a professional, working digital business faster while keeping the result recognizably theirs.",
     proof: "Public Wix evidence indicates faster publishing, strong use of AI assistance and continued active user editing.",
     direction: "Expand from website creation toward a broader platform where people and AI build and operate digital businesses together.",
@@ -784,6 +863,7 @@ const narrativeMap = {
     {
       id: "claim_publish_speed",
       statement: "AI reduces website publishing time.",
+      narrativeStage: "proven_today",
       evidence: [
         { evidenceId: "ev_publish_speed", relevance: "direct", rationale: "Directly evidences this claim: average publishing time fell from eight days to four." },
       ],
@@ -791,6 +871,7 @@ const narrativeMap = {
     {
       id: "claim_user_refine",
       statement: "Users continue to refine AI-generated outputs.",
+      narrativeStage: "proven_today",
       evidence: [
         { evidenceId: "ev_user_editing", relevance: "direct", rationale: "Directly evidences this claim: most users actively rewrite AI-generated copy and replace images rather than publishing as-is." },
       ],
@@ -798,6 +879,7 @@ const narrativeMap = {
     {
       id: "claim_combine_ai_manual",
       statement: "Wix combines AI creation with manual editing.",
+      narrativeStage: "proven_today",
       evidence: [
         { evidenceId: "ev_aria_agent", relevance: "direct", rationale: "Describes the exact mechanism — Aria generates, users refine — that this claim asserts." },
         { evidenceId: "ev_harmony_tension", relevance: "direct", rationale: "Wix's own stated design intent names exactly this combination." },
@@ -806,6 +888,7 @@ const narrativeMap = {
     {
       id: "claim_expansion",
       statement: "Wix is expanding beyond traditional website creation.",
+      narrativeStage: "in_build",
       evidence: [
         { evidenceId: "ev_base44_arr", relevance: "direct", rationale: "Base44 (~$150M ARR) is itself an instance of expansion into app creation beyond website building." },
         { evidenceId: "ev_harmony_model", relevance: "partial", rationale: "A proprietary AI model investment is consistent with expansion beyond a simple website builder, but doesn't by itself prove the expansion claim." },

@@ -391,7 +391,8 @@ class RetryEndpoints(unittest.TestCase):
             "evidence": [{"id": "ev1", "sourceId": "src1", "excerpt": "The company serves manufacturing customers.",
                           "paraphrase": "p", "evidenceType": "statement", "strength": "moderate", "freshness": "current"}],
             "strategicFoundation": [{"id": "sf1", "type": "customer", "statement": "Serves manufacturing customers.",
-                                      "statementType": "source_fact", "evidence": [{"evidenceId": "ev1", "relevance": "direct", "rationale": "r"}]}],
+                                      "statementType": "source_fact", "narrativeStage": "proven_today",
+                                      "evidence": [{"evidenceId": "ev1", "relevance": "direct", "rationale": "r"}]}],
         }
         patch("anthropic_pipeline.extract_foundation", return_value=foundation_result).start()
 
@@ -1077,16 +1078,17 @@ class StageProgressReporting(unittest.TestCase):
         self.assertEqual(body["usage"]["totals"], {"input_tokens": 100, "output_tokens": 50})
 
 
-def _gate(candidate_id, strategic="meets", differentiation="meets", evidence="supported"):
+def _gate(candidate_id, strategic="meets", differentiation="meets", evidence="supported", altitude="meets"):
     return {"candidateId": candidate_id, "findings": ["ok"], "strategicFitGate": strategic,
-            "differentiationGate": differentiation, "evidenceSupportGate": evidence}
+            "differentiationGate": differentiation, "evidenceSupportGate": evidence, "companyAltitudeGate": altitude}
 
 
 def _candidate(i):
     return {"id": f"cand{i}", "name": f"Candidate {i}", "oneSentenceStory": "x",
             "sevenParts": {k: "x" for k in ["context", "tension", "belief", "role", "value", "proof", "direction"]},
             "strategicLogic": ["x"], "customerRelevance": "x", "differentiation": "x",
-            "tradeoffs": ["x"], "risks": ["x"], "claims": []}
+            "tradeoffs": ["x"], "risks": ["x"], "claims": [],
+            "narrativeStages": [{"stage": "proven_today", "statement": "x", "evidence": []}]}
 
 
 _VALID_NARRATIVE_MAP = {
@@ -1120,7 +1122,8 @@ class RecommendationOutcomeContract(unittest.TestCase):
             "evidence": [{"id": "ev1", "sourceId": "src_live_company", "excerpt": "The company serves manufacturing customers.",
                           "paraphrase": "p", "evidenceType": "statement", "strength": "moderate", "freshness": "current"}],
             "strategicFoundation": [{"id": "sf1", "type": "customer", "statement": "Serves manufacturing customers.",
-                                     "statementType": "source_fact", "evidence": [{"evidenceId": "ev1", "relevance": "direct", "rationale": "r"}]}],
+                                     "statementType": "source_fact", "narrativeStage": "proven_today",
+                                     "evidence": [{"evidenceId": "ev1", "relevance": "direct", "rationale": "r"}]}],
         })
         self._patch("anthropic_pipeline.diagnose", side_effect=lambda *a, **k: {
             "evidence": [], "diagnosis": [{"id": "d1", "title": "t", "explanation": "The company serves manufacturing customers.",

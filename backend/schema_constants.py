@@ -31,6 +31,45 @@ EVIDENCE_STRENGTH_TYPES = ["strong", "moderate", "weak", "unsupported"]
 EVIDENCE_FRESHNESS_TYPES = ["current", "aging", "stale"]
 SIGNIFICANCE_TYPES = ["high", "medium", "low"]
 
+# Temporal/maturity axis — orthogonal to statementType (which answers "how do we know
+# this," an epistemic question) and to a StrategicChoice's `type` (what KIND of claim).
+# narrativeStage answers "when is this true." A claim can be e.g. storymap_synthesis +
+# in_build at once: both axes are real and independent, neither implies the other.
+# Required on every StrategicChoice/NarrativeCoreClaim except type=="unresolved" (a
+# leadership decision about a story GAP has no temporal status of its own, exactly like
+# it has no evidence model / confidence — see confidence.py). Model-classified, never
+# inferred from `type` (a "capability" can be proven_today, emerging, or in_build; a
+# "way_to_win" can describe current advantage or future intent — type and maturity are
+# independent, so no type -> stage lookup table exists anywhere in this codebase).
+NARRATIVE_STAGES = [
+    "proven_today",
+    "emerging",
+    "in_build",
+    "strategic_direction",
+    "aspiration_pending_leadership",
+]
+
+NARRATIVE_STAGE_LABELS = {
+    "proven_today": "Proven today",
+    "emerging": "Emerging",
+    "in_build": "In build",
+    "strategic_direction": "Strategic direction",
+    "aspiration_pending_leadership": "Aspiration — requires leadership approval",
+}
+
+# One-line temporal-honesty guidance per stage, shared verbatim between the prompt (so the
+# model is told the same rule it's graded on) and statement_type_check.py's language
+# checks below. "is/has/does" for proven_today down to "could/intends to" for aspiration —
+# a future state must never be phrased as already achieved, regardless of how much
+# evidence supports it.
+NARRATIVE_STAGE_WORDING_GUIDANCE = {
+    "proven_today": "present tense, stated as fact: is, has, does",
+    "emerging": "is beginning to, is increasingly",
+    "in_build": "is building, is developing, is assembling",
+    "strategic_direction": "is moving toward, aims to become, is positioning to",
+    "aspiration_pending_leadership": "could, intends to — explicitly leadership-owned, never asserted as decided",
+}
+
 # A StrategicChoice with type != "unresolved" is an actual analyzed claim, so its
 # statementType may never be "leadership_decision" (that means "no claim yet, still
 # needs deciding" — reserved exclusively for type == "unresolved") or "recommendation"
